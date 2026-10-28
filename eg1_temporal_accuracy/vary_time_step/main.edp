@@ -1,0 +1,981 @@
+/* ===============================================================
+ Variable-density NS manufactured-solution convergence test.
+=============================================================== */
+include "ffmatlib.idp"
+load "UMFPACK64"
+load "Element_Mixte"
+load "Element_P3"
+include "NewViscosity.idp"
+
+
+// ---------- parameters ----------
+real T0 = 0.0, Tend = 0.4; //new1
+int  L  = 4;          // final levels: Nt=10,20,40,80
+int  NxFixed = 800;   // fixed boundary points for unit circle mesh
+int  Nt0 = 10;
+real gradeGamma = 1.5; // t_n=T0+(Tend-T0)*(n/Nt)^gradeGamma
+int  printEvery = 999999;
+int  Itenum = 1e3;    // max iterations for projection
+
+real Qcsav = 1e-3; // paper alpha auxiliary-variable coefficient
+real Zbeta = 1e-3; // paper beta auxiliary-variable coefficient
+real tol  = 0.5e-13;    // tolerance for projection Newton
+
+int  kIdx = 0;
+
+/* Kappa Parameters */
+real Cflat = 0.1;
+real Cmax = 1.0;
+real betaU = 1.0;
+
+real histInfRhoU  = 1.0e-16;
+real histInfRhoUU = 1.0e-16;
+real histInfU     = 1.0e-16;
+
+
+
+// ---------- exact / manufactured solution ----------
+real epsRho = 0.2;
+
+func real qsw(real x, real y){
+    return 1.0 - x*x - y*y;
+}
+
+func real rhoExact(real x, real y, real t){
+    real B = qsw(x,y)*sin(t);
+    return 2.0 + epsRho*( x*cos(B) + y*sin(B) );
+}
+
+func real rhodx(real x, real y, real t){
+    real B  = qsw(x,y)*sin(t);
+    real Bx = -2.0*x*sin(t);
+    return epsRho*( cos(B) + Bx*(-x*sin(B) + y*cos(B)) );
+}
+
+func real rhody(real x, real y, real t){
+    real B  = qsw(x,y)*sin(t);
+    real By = -2.0*y*sin(t);
+    return epsRho*( sin(B) + By*(-x*sin(B) + y*cos(B)) );
+}
+
+func real u1Exact(real x, real y, real t){
+    return -y*qsw(x,y)*cos(t);
+}
+
+func real u2Exact(real x, real y, real t){
+    return x*qsw(x,y)*cos(t);
+}
+
+func real pExact(real x, real y, real t){
+    return sin(x)*sin(y)*sin(t);
+}
+
+// velocity derivatives
+func real u1dx(real x, real y, real t){
+    return 2.0*x*y*cos(t);
+}
+
+func real u1dy(real x, real y, real t){
+    return (-1.0 + x*x + 3.0*y*y)*cos(t);
+}
+
+func real u2dx(real x, real y, real t){
+    return (1.0 - 3.0*x*x - y*y)*cos(t);
+}
+
+func real u2dy(real x, real y, real t){
+    return -2.0*x*y*cos(t);
+}
+
+// pressure derivatives
+func real pdx(real x, real y, real t){
+    return cos(x)*sin(y)*sin(t);
+}
+
+func real pdy(real x, real y, real t){
+    return sin(x)*cos(y)*sin(t);
+}
+
+// viscosity 
+
+real epsR1 = 1e-8;
+
+
+real muMin = 0.1; 
+real Amp = 1.0; 
+func real muExact(real x, real y, real t){ 
+         //0.995 1.015  
+         real r2 = x*x + y*y; 
+       return muMin + Amp * r2 * (1.0 + sin(t));
+	   //real Re = 100.0;
+       //return  1.0/Re;   
+}
+
+
+
+
+// ---------- body force (includes grad p) ----------
+func real mudx(real x, real y, real t){
+    return 2.0*Amp*x*(1.0 + sin(t));
+}
+
+func real mudy(real x, real y, real t){
+    return 2.0*Amp*y*(1.0 + sin(t));
+}
+
+func real f21Exact(real x, real y, real t){
+    real rho = rhoExact(x,y,t);
+    real q   = qsw(x,y);
+    real ct  = cos(t);
+    real st  = sin(t);
+
+    real mu  = muExact(x,y,t);
+    real mux = mudx(x,y,t);
+    real muy = mudy(x,y,t);
+
+    // u_t + u · grad u
+    real acc1 = y*q*st - x*q*q*ct*ct;
+
+    // D11 = 2 u1x, D12 = u1y + u2x
+    real D11 = 4.0*x*y*ct;
+    real D12 = 2.0*(y*y - x*x)*ct;
+
+    // div( mu*(grad u + grad u^T) )_1
+    real divStress1 = 8.0*mu*y*ct + mux*D11 + muy*D12;
+
+    return rho*acc1 - divStress1 + pdx(x,y,t);
+}
+
+func real f22Exact(real x, real y, real t){
+    real rho = rhoExact(x,y,t);
+    real q   = qsw(x,y);
+    real ct  = cos(t);
+    real st  = sin(t);
+
+    real mu  = muExact(x,y,t);
+    real mux = mudx(x,y,t);
+    real muy = mudy(x,y,t);
+
+    // u_t + u · grad u
+    real acc2 = -x*q*st - y*q*q*ct*ct;
+
+    // D12 = u1y + u2x, D22 = 2 u2y
+    real D12 = 2.0*(y*y - x*x)*ct;
+    real D22 = -4.0*x*y*ct;
+
+    // div( mu*(grad u + grad u^T) )_2
+    real divStress2 = -8.0*mu*x*ct + mux*D12 + muy*D22;
+
+    return rho*acc2 - divStress2 + pdy(x,y,t);
+}
+
+
+
+// ---------- macros ----------
+macro Grad(u1,u2) [dx(u1), dy(u1), dx(u2), dy(u2)]//
+macro div(u1,u2)  (dx(u1) + dy(u2))//
+macro e11(u1, u2) dx(u1) // 
+macro e22(u1, u2) dy(u2) // 
+macro e12(u1, u2) (0.5 * (dy(u1) + dx(u2))) //
+// Convective skew form
+macro ConvSkew(rho,a1,a2,b1,b2,V1,V2)
+( (rho)*(a1*dx(b1)+a2*dy(b1))*V1
++ (rho)*(a1*dx(b2)+a2*dy(b2))*V2
++ 0.5*( dx(rho)*a1 + (rho)*dx(a1) + dy(rho)*a2 + (rho)*dy(a2) )*( b1*V1 + b2*V2 ) ) //
+
+/*macro ConvSkew1(rho,a1,a2,b1,b2,V1,V2)
+( (rho)*(a1*dx(b1)+a2*dy(b1))*V1
++ (rho)*(a1*dx(b2)+a2*dy(b2))*V2
++ 0.25*( (rho)*dx(a1) + (rho)*dy(a2) )*( b1*V1 + b2*V2 ) ) //*/
+
+macro convone(mu,b1,b2,v1,v2)
+( ( dx(b1)*dx(mu) + dx(b2)*dy(mu) )*v1 + ( dy(b1)*dx(mu) + dy(b2)*dy(mu) )*v2 )//
+
+
+
+
+real epsp = 1e-10;   // pressure stabilization
+//real gammaGD = 0.0;  // optional grad-div
+real tinyDrag = 0.0; // optional linear drag
+
+// ---------- I/O ----------
+ofstream fupK("./NS_BP_QM_TF_PnonTF_graded_final_N10_N20_N40_N80_gamma1p5.txt");
+fupK.precision(16);
+ofstream fTS("timeseries_graded_final_N10_N20_N40_N80_gamma1p5.txt");
+fTS.precision(16);
+fTS << "lev\tNt\tstep\tt\ttau\tratio\tMass\tMassError\trhoMin\trhoMax"
+    << "\talpha\tbeta\tEm1\tEm2\tEm3\tEm\tPowerF\tWorkInc\tWorkCum"
+    << "\tKappaMin\tKappaMax\n";
+
+ofstream fCPU("CPUTime_graded_final_N10_N20_N40_N80_gamma1p5.txt");
+fCPU.precision(16);
+fCPU << "lev\tNt\tNx\ttauMin\ttauMax\tratioMin\tratioMax"
+     << "\tTimeMarchCPU\tLevelCPU\tCPUPerStep\n";
+
+ofstream fN("NewtonData_graded_final_N10_N20_N40_N80_gamma1p5.txt");
+fN.precision(16);
+fN << "t\txiIters\tF\txi\n";
+
+fupK << "% time_grid=graded, gradeGamma=" << gradeGamma
+     << ", Qcsav=" << Qcsav
+     << ", Zbeta=" << Zbeta
+     << ", T0=" << T0
+     << ", Tend=" << Tend
+     << ", tol=" << tol << endl;
+fupK.flush;
+cout << "[params] timeGrid=graded"
+     << " gradeGamma=" << gradeGamma
+     << " Qcsav=" << Qcsav
+     << " Zbeta=" << Zbeta
+     << " T0=" << T0
+     << " Tend=" << Tend << endl;
+
+fupK << "NX\t&\tNT\t&\th\t&\ttauMax"
+     << "\t&\teuL2\t&\truL2"
+     << "\t&\teuH1\t&\truH1"
+     << "\t&\tedivL2\t&\trdivL2"
+     << "\t&\tedivHm1\t&\trdivHm1"
+     << "\t&\tepL2\t&\trpL2"
+     // << "\t&\tepH1\t&\trpH1"
+     << "\t&\terhoL2\t&\trrhoL2"
+     // << "\t&\terhoH1\t&\trrhoH1"
+     << "\t&\talphaLinf\t&\trAlphaLinf"
+     // << "\t&\talphaL2\t&\trAlphaL2"
+     << "\t&\tbetaLinf\t&\trBetaLinf"
+     // << "\t&\tbetaL2\t&\trBetaL2"
+     << "\t\\ \\hline" << endl;
+fupK.flush;
+
+// Previous-level data for rates based on tauMax.
+real prevTauMax = 0.0;
+real prevL2 = 0.0, prevH1 = 0.0, prevDivL2 = 0.0, prevDivHm1 = 0.0;
+real prevP = 0.0, prevRho = 0.0;
+real prevAlphaInf = 0.0;
+// real prevAlphaL2 = 0.0;
+real prevBetaInf = 0.0;
+// real prevBetaL2 = 0.0;
+// real prevPH1 = 0.0, prevRhoH1 = 0.0;
+// ========================
+// debug
+// ========================
+
+real prevL2uFE = 0.0, prevH1uFE = 0.0;
+real prevL2pFE = 0.0, prevH1pFE = 0.0;
+real prevL2rhoFE = 0.0, prevH1rhoFE = 0.0;
+
+
+// ---- projection scalars (once per level) ----
+int  qOrd = 10;   // quadrature for energy and diagnostics
+real xi   = 0.0;  // Lagrange multiplier
+int  xiIters = 0; // iteration count
+
+border C(s=0, 2*pi){ x = cos(s); y = sin(s); label = 1; }
+
+int  NxInit = NxFixed;
+
+mesh Th = buildmesh( C(NxInit) );
+
+// FE spaces
+ fespace Vh(Th,P3);
+ fespace Qh(Th,P2);
+ fespace S2h(Th,P3);
+ fespace P0h(Th,P0);
+
+
+  // Bezier limiter for continuous P2 density
+  include "BezierP3Limiter.idp"
+
+matrix Aalpha;
+
+  varf vAlphaL(a,b) =
+    int2d(Th, qforder=6)(
+        a*b
+      + square(hTriangle)*(dx(a)*dx(b) + dy(a)*dy(b))
+    );
+macro BuildAlphaMatrix(S2h) {
+    Aalpha = vAlphaL(S2h, S2h);
+    set(Aalpha, solver=UMFPACK);
+} //
+
+
+
+ 
+int[int] NtList(L);
+NtList[0] = Nt0;
+for (int iNt=1; iNt<L; ++iNt){
+    NtList[iNt] = 2 * NtList[iNt-1];
+}
+
+// Deterministic nested graded time grids:
+// t_n = T0 + (Tend-T0)*(n/Nt)^gradeGamma.
+// Because Nt doubles between levels, every coarse node is also a fine node.
+// For gradeGamma=1.5, the largest adjacent-step ratio is
+// tau_2/tau_1 = 2^gradeGamma-1 ~= 1.828427 < 2.
+int NtMax = NtList[L-1];
+if ((L != 4) || (NtList[0] != 10) || (NtList[1] != 20)
+    || (NtList[2] != 40) || (NtList[3] != 80)) {
+    cout << "[time grid] ERROR: graded final expects "
+         << "NtList={10,20,40,80}, got {"
+         << NtList[0] << "," << NtList[1]
+         << "," << NtList[2] << "," << NtList[3] << "}" << endl;
+    exit(1);
+}
+if (gradeGamma <= 0.0) {
+    cout << "[time grid] ERROR: gradeGamma must be positive, got "
+         << gradeGamma << endl;
+    exit(1);
+}
+
+ 
+
+// ---------- refinement loop ----------
+real totalCpuStart = clock();
+for (int lev=0; lev<L; ++lev){
+
+    histInfRhoU  = 1.0e-16;
+    histInfRhoUU = 1.0e-16;
+    histInfU     = 1.0e-16;
+
+  real levCpuStart = clock();
+
+  // Fixed spatial mesh; only the deterministic graded time grid is refined.
+  int Nt = NtList[lev];
+  int Nx = NxFixed;
+  real h = 2.0*pi/NxFixed;
+
+  if ((NtMax % Nt) != 0) {
+      cout << "[time grid] ERROR: Nt=" << Nt
+           << " does not divide NtMax=" << NtMax << endl;
+      exit(1);
+  }
+
+  real[int] dtLevel(Nt);
+  real[int] timeLevel(Nt+1);
+
+  // Build nodes first from the exact graded-grid formula, then difference
+  // consecutive nodes. No random number and no last-step truncation are used.
+  for (int nGrid=0; nGrid<=Nt; ++nGrid) {
+      real sGrid = (1.0*nGrid)/(1.0*Nt);
+      timeLevel[nGrid] = T0 + (Tend-T0)*pow(sGrid,gradeGamma);
+  }
+  timeLevel[0] = T0;
+  timeLevel[Nt] = Tend;
+
+  real tauSumLev = 0.0;
+  for (int nGrid=0; nGrid<Nt; ++nGrid) {
+      dtLevel[nGrid] = timeLevel[nGrid+1]-timeLevel[nGrid];
+      tauSumLev += dtLevel[nGrid];
+  }
+
+  real tauMinLev = dtLevel[0];
+  real tauMaxLev = dtLevel[0];
+  real ratioMinLev = 1.0;
+  real ratioMaxLev = 1.0;
+  if (Nt >= 2) {
+      ratioMinLev = dtLevel[1]/dtLevel[0];
+      ratioMaxLev = ratioMinLev;
+  }
+  for (int nGrid=0; nGrid<Nt; ++nGrid) {
+      if (dtLevel[nGrid] <= 0.0) {
+          cout << "[time grid] ERROR: non-positive step at lev=" << lev
+               << " n=" << nGrid << " tau=" << dtLevel[nGrid] << endl;
+          exit(1);
+      }
+      tauMinLev = min(tauMinLev,dtLevel[nGrid]);
+      tauMaxLev = max(tauMaxLev,dtLevel[nGrid]);
+      if (nGrid >= 1) {
+          real ratioGrid = dtLevel[nGrid]/dtLevel[nGrid-1];
+          ratioMinLev = min(ratioMinLev,ratioGrid);
+          ratioMaxLev = max(ratioMaxLev,ratioGrid);
+          if ((ratioGrid < 0.5-1.0e-14) || (ratioGrid > 2.0+1.0e-14)) {
+              cout << "[time grid] ERROR: step ratio outside [0.5,2] at lev="
+                   << lev << " n=" << nGrid << " ratio=" << ratioGrid << endl;
+              exit(1);
+          }
+      }
+  }
+  if (abs(timeLevel[Nt]-Tend) > 1.0e-13) {
+      cout << "[time grid] ERROR: final time mismatch at lev=" << lev
+           << " tFinal=" << timeLevel[Nt] << endl;
+      exit(1);
+  }
+  if (abs(tauSumLev-(Tend-T0)) > 1.0e-13) {
+      cout << "[time grid] ERROR: step sum mismatch at lev=" << lev
+           << " sumTau=" << tauSumLev
+           << " expected=" << Tend-T0 << endl;
+      exit(1);
+  }
+
+  // Verify the analytic nesting against the finest graded grid.
+  int finePerStep = NtMax/Nt;
+  real nestedErrMax = 0.0;
+  for (int nGrid=0; nGrid<=Nt; ++nGrid) {
+      int jFine = nGrid*finePerStep;
+      real sFine = (1.0*jFine)/(1.0*NtMax);
+      real tFineAtCoarseNode = T0 + (Tend-T0)*pow(sFine,gradeGamma);
+      nestedErrMax = max(nestedErrMax,abs(timeLevel[nGrid]-tFineAtCoarseNode));
+  }
+  if (nestedErrMax > 1.0e-13) {
+      cout << "[time grid] ERROR: grids are not nested at lev=" << lev
+           << " nestedErrMax=" << nestedErrMax << endl;
+      exit(1);
+  }
+
+  cout << "[time grid] lev=" << lev << " Nt=" << Nt
+       << " gradeGamma=" << gradeGamma
+       << " tauMinLev=" << tauMinLev << " tauMaxLev=" << tauMaxLev
+       << " ratioMinLev=" << ratioMinLev << " ratioMaxLev=" << ratioMaxLev
+       << " sumTau=" << tauSumLev
+       << " nestedErrMax=" << nestedErrMax
+       << " tFinal=" << timeLevel[Nt] << endl;
+
+ 
+
+ Th = buildmesh( C(Nx) );
+
+  // After rebuilding Th, all Bezier data must be rebuilt.
+nBezierDof = S2h.ndof;
+Wb.resize(nBezierDof);
+
+BuildBezierDofKP3(Th, S2h, BezierDofKP3);
+BuildBezierWeightsP3(BezierDofKP3, Wb);
+   
+  BuildAlphaMatrix(S2h);
+
+S2h hRV, hTest;
+
+P0h areaK = area;
+int polyDegRV = 3;
+
+solve SmoothMeshSize(hRV, hTest, solver=UMFPACK) =
+      int2d(Th, qforder=10)(
+          hRV*hTest
+        + areaK*(dx(hRV)*dx(hTest) + dy(hRV)*dy(hTest))
+      )
+    - int2d(Th, qforder=10)(
+          sqrt(areaK)/polyDegRV*hTest
+      );
+
+  //fespace P0mac(Th, P1dc);
+  //P0mac phiProj, qProj;
+
+  // fields
+  Vh uhat1,uhat2, uTF1,uTF2,u1n,u2n, u1nm1,u2nm1, uu1,uu2, u1star,u2star,w1,w2,what1,what2,D2w1,D2w2;
+  Vh u1nm3,u2nm3; Vh u1nm2, u2nm2;
+  Qh p, pTF,pn, pnm1, pStar, pp;
+  Qh phiDivHm1, testDivHm1;
+  S2h sig, sigN, sigNm1, sighat, sighatN, sighatNm1,
+     rho, rhoN, rhoNm1, rhotilde, rhotildehat, rhotildeN, rhotildeNm1, muF, divUnF, qs;  //
+  S2h rhoNm2,rhoNm3;
+  P0h hK = hTriangle, tauK, uMagK; //the coefficient of SUPG
+  S2h q;
+  S2h divuRT,divuTF,divunonTF;
+  S2h divutilde,divuTrue;
+  Vh u1True,u2True;
+  S2h Kappa , KappaU,AlphaFinal;
+  S2h RatioRho,RatioMom,RatioDiv;
+  S2h kUFloorMask;
+// P2 high-mode sensor variables
+Qh rhoLowSensor;
+S2h rhoHighSensor, highSensor, kappaHigh;
+//S2h alphaEff, kappaDamp;
+//S2h kappaFloor;
+S2h KappaCap, KappaFloor, kappaDamp;
+S2h KappaRaw;
+S2h AlphaRaw;
+
+P0h uEffK, KappaURaw;
+P0h uEffRhoK;
+
+S2h f1RV, f2RV;
+
+  
+  
+
+
+
+  
+  P0h nudc,cflField;
+  P0h gr;
+  P0h rr;
+  P0h cap;
+  P0h gr2;
+  P0h rr2;
+  P0h cap2;
+  P0h gammaGD;
+
+  // Time errors for the paper alpha and beta auxiliary variables.
+  real alphaErrSup = 0.0;
+  // real alphaErrL2 = 0.0;
+  real betaErrSup = 0.0;
+  // real betaErrL2 = 0.0;
+  real WorkCum = 0.0;
+  
+
+  // initial data at t0
+  real t = T0;
+  S2h rho0h = rhoExact(x,y,t);
+  real rho0min = 1.8;
+  real rho0max = 2.2;
+   real rhoPhysMin = 0.0;
+  real rhoPhysMax = 0.0;
+
+  // Strict Bernstein bound for initial P2 density
+  BezierClipP3(rho0h, rho0min, rho0max);
+
+  u1n = u1Exact(x,y,t); u2n = u2Exact(x,y,t);
+  u1nm1 = u1n; u2nm1 = u2n; u1nm2 = u1n; u2nm2 = u2n;u1nm3 = u1n; u2nm3 = u2n;
+  rho = rho0h;
+  rhoN = rho; rhoNm1 = rho; rhoNm2 = rho; rhoNm3 = rho;
+  rhotilde = rho0h;
+  rhotildeN = rhotilde; rhotildeNm1 = rhotilde; 
+  pn = pExact(x,y,t); pnm1 = pn;
+
+  sigN = sqrt( rho );
+  sigNm1 = sigN;
+  sig = sqrt( rho );
+
+  real Mnm1=1.0, Mn=1.0, M=1.0, MTF=1.0;
+  real BauxNm1=1.0, BauxN=1.0, BauxHat=1.0, BauxTF=1.0;
+
+  // --------- build consistent P1 mass weights ML ----------
+  int qOrdM = 10;
+
+real Mreal = int2d(Th, qforder=qOrdM)(rho0h);
+real M0    = Mreal;
+
+real M0h = 0.0;
+BezierMassP3(rho0h, M0h);
+
+real M1h = M0h;
+
+cout << "rho0min = " << rho0min << " rho0max = " << rho0max << endl;
+cout << "Target Mass M0h = " << M0h << endl;
+
+real Massh0 = 0.0;
+real Massh  = 0.0;
+real mResh0 = 0.0;
+real mResh  = 0.0;
+
+
+
+
+  // ===== Initial residual viscosity and accepted state at t^0 =====
+  real epsU = 1.0e-12;
+  real Cgamma = 200.0;
+  real dtCur = dtLevel[0];
+  real dtPrev = dtCur;
+  real rStep = 1.0;
+  real filterCoef = 0.0;
+  real tauR1 = dtLevel[0];
+  real tauR2 = tauR1;
+  real tauR3 = tauR1;
+  int rvOrder = 1;
+  real tRv = timeLevel[0];
+  real timeMarchCpuStart = clock();
+
+  muF = muExact(x,y,tRv);
+  f1RV = f21Exact(x,y,tRv);
+  f2RV = f22Exact(x,y,tRv);
+  ComputeResidualViscosity(
+      Th,S2h,
+      u1n,u2n,pn,rhoN,
+      muF,f1RV,f2RV,
+      u1nm1,u2nm1,rhoNm1,
+      u1nm2,u2nm2,rhoNm2,
+      u1nm3,u2nm3,rhoNm3,
+      tauR1,tauR2,tauR3,Cflat,Cmax,hRV,
+      histInfRhoU,histInfRhoUU,histInfU,
+      Kappa,AlphaFinal,RatioRho,RatioMom,RatioDiv,AlphaRaw,rvOrder
+  );
+
+  BezierMassP3(rho,Massh0);
+  mResh0 = Massh0-M0h;
+  RhoPhysicalMinMax(rho,rhoPhysMin,rhoPhysMax);
+  real Em1 = 0.5*int2d(Th,qforder=qOrd)(sqr(sigN*u1n)+sqr(sigN*u2n));
+  real Em2 = Mn/Qcsav;
+  real Em3 = (BauxN-1.0)/Zbeta;
+  real Em = Em1+Em2+Em3;
+  real PowerF = 0.0;
+  real WorkInc = 0.0;
+  real KappaMin = Kappa[].min;
+  real KappaMax = Kappa[].max;
+  fTS << lev << "\t" << Nt << "\t" << 0 << "\t" << timeLevel[0]
+      << "\t" << 0.0 << "\t" << 1.0
+      << "\t" << Massh0 << "\t" << mResh0
+      << "\t" << rhoPhysMin << "\t" << rhoPhysMax
+      << "\t" << Mn << "\t" << BauxN
+      << "\t" << Em1 << "\t" << Em2 << "\t" << Em3 << "\t" << Em
+      << "\t" << PowerF << "\t" << WorkInc << "\t" << WorkCum
+      << "\t" << KappaMin << "\t" << KappaMax << "\n";
+  fTS.flush;
+
+  // ===== Start-up step: first-order predictor at tau_1 =====
+  t = timeLevel[1];
+  uMagK = sqrt(u1n*u1n+u2n*u2n)+epsU;
+  gammaGD = Cgamma*hK*rhoN*(uMagK+1.0e-6);
+
+  solve RhotildeSys1(rhotilde,qs,solver=UMFPACK) =
+      int2d(Th,qforder=10)(
+          (rhotilde/dtCur)*qs
+        - rhotilde*(u1n*dx(qs)+u2n*dy(qs))
+        + Kappa*(dx(rhotilde)*dx(qs)+dy(rhotilde)*dy(qs))
+      )
+    + int1d(Th,1,qforder=10)(max(u1n*N.x+u2n*N.y,0.0)*rhotilde*qs)
+    + int1d(Th,1,qforder=10)(min(u1n*N.x+u2n*N.y,0.0)*rhoExact(x,y,t)*qs)
+    - int2d(Th,qforder=10)((rhotildeN/dtCur)*qs);
+
+  {
+      real Fproj = 0.0;
+      BezierMassProjectClipP3(rhotilde,rho,rho0min,rho0max,M0h,xi,xiIters,Fproj);
+      if (lev == L-1) {
+          fN << t << "\t" << xiIters << "\t" << Fproj << "\t" << xi << "\n";
+          fN.flush;
+      }
+      sig = sqrt(rho);
+  }
+
+  BezierMassP3(rho,Massh);
+  mResh = Massh-M1h;
+  muF = muExact(x,y,t);
+
+  solve MomSys1([uhat1,uhat2,p],[uu1,uu2,pp]) =
+      int2d(Th,qforder=10)(
+          BauxN*(sig*sig/dtCur)*(uhat1*uu1+uhat2*uu2)
+        + Mn*muF*Grad(uhat1,uhat2)'*Grad(uu1,uu2)
+        + ConvSkew(rho,u1n,u2n,uhat1,uhat2,uu1,uu2)
+        - p*div(uu1,uu2)+pp*div(uhat1,uhat2)
+        + p*pp*epsp+gammaGD*div(uhat1,uhat2)*div(uu1,uu2)
+      )
+    + on(1,uhat1=u1Exact(x,y,t),uhat2=u2Exact(x,y,t))
+    + int2d(Th,qforder=10)(
+          betaU*Kappa*rho*(2.0*dx(uhat1)*dx(uu1)+2.0*dy(uhat2)*dy(uu2)
+            +(dy(uhat1)+dx(uhat2))*(dy(uu1)+dx(uu2)))
+      )
+    + int2d(Th,qforder=10)(
+         -Kappa*dx(rho)*(uu1*dx(uhat1)+uu2*dx(uhat2))
+         -Kappa*dy(rho)*(uu1*dy(uhat1)+uu2*dy(uhat2))
+         +0.5*Kappa*dx(rho)*(dx(uhat1)*uu1+uhat1*dx(uu1)+dx(uhat2)*uu2+uhat2*dx(uu2))
+         +0.5*Kappa*dy(rho)*(dy(uhat1)*uu1+uhat1*dy(uu1)+dy(uhat2)*uu2+uhat2*dy(uu2))
+      )
+    - int2d(Th,qforder=10)(
+          BauxN*(sig*sigN/dtCur)*(u1n*uu1+u2n*uu2)
+        + Mn*convone(muF,u1n,u2n,uu1,uu2)
+        + f21Exact(x,y,t)*uu1+f22Exact(x,y,t)*uu2
+      );
+
+  uTF1=uhat1; uTF2=uhat2; pTF=p;
+  real BM0 = int2d(Th,qforder=10)(
+      2.0*muF*(sqr(e11(uhat1,uhat2))+sqr(e22(uhat1,uhat2))+2.0*sqr(e12(uhat1,uhat2))));
+  real BM1 = int2d(Th,qforder=10)(
+      -muF*Grad(uhat1,uhat2)'*Grad(uhat1,uhat2)+convone(muF,u1n,u2n,uhat1,uhat2));
+  M = Mn+Qcsav*dtCur*(-BM0-Mn*BM1);
+  MTF = M;
+
+  w1=sig*uTF1; w2=sig*uTF2;
+  BauxHat = 1.0+0.5*Zbeta*int2d(Th,qforder=qOrd)(
+      sqr(w1-sigN*u1n)+sqr(w2-sigN*u2n));
+  BauxTF = BauxHat;
+
+  real alphaErr=abs(MTF-1.0), betaErr=abs(BauxTF-1.0);
+  alphaErrSup=max(alphaErrSup,alphaErr); betaErrSup=max(betaErrSup,betaErr);
+  // alphaErrL2+=dtCur*sqr(alphaErr); betaErrL2+=dtCur*sqr(betaErr);
+
+  // WorkCum is the direct time-step-weighted cumulative external-force work.
+  PowerF=int2d(Th,qforder=qOrd)(f21Exact(x,y,t)*uhat1+f22Exact(x,y,t)*uhat2);
+  WorkInc=dtCur*PowerF;
+  WorkCum+=WorkInc;
+
+  BezierMassP3(rho,Massh0); mResh0=Massh0-M0h;
+  RhoPhysicalMinMax(rho,rhoPhysMin,rhoPhysMax);
+  Em1=0.5*int2d(Th,qforder=qOrd)(sqr(sig*uTF1)+sqr(sig*uTF2));
+  Em2=MTF/Qcsav; Em3=(BauxTF-1.0)/Zbeta; Em=Em1+Em2+Em3;
+  KappaMin=Kappa[].min; KappaMax=Kappa[].max;
+  fTS << lev << "\t" << Nt << "\t" << 1 << "\t" << t
+      << "\t" << dtCur << "\t" << 1.0
+      << "\t" << Massh0 << "\t" << mResh0 << "\t" << rhoPhysMin << "\t" << rhoPhysMax
+      << "\t" << MTF << "\t" << BauxTF
+      << "\t" << Em1 << "\t" << Em2 << "\t" << Em3 << "\t" << Em
+      << "\t" << PowerF << "\t" << WorkInc << "\t" << WorkCum
+      << "\t" << KappaMin << "\t" << KappaMax << "\n";
+  fTS.flush;
+
+  // Roll only after all startup diagnostics and beta/energy/work updates.
+  u1nm3=u1nm2; u2nm3=u2nm2; u1nm2=u1nm1; u2nm2=u2nm1;
+  u1nm1=u1n; u2nm1=u2n; u1n=uTF1; u2n=uTF2;
+  pnm1[]=pn[]; pn[]=pTF[]; sigNm1=sigN; sigN=sig;
+  Mnm1=Mn; Mn=MTF; BauxNm1=BauxN; BauxN=BauxTF;
+  rhoNm3=rhoNm2; rhoNm2=rhoNm1; rhoNm1=rhoN; rhoN=rho;
+  rhotildeNm1=rhotildeN; rhotildeN=rho;
+
+  // ===== Variable-step predictor-filter-project loop =====
+  for (int k=1; k<Nt; ++k) {
+      dtCur=dtLevel[k]; dtPrev=dtLevel[k-1]; rStep=dtCur/dtPrev;
+      filterCoef=rStep/(1.0+2.0*rStep); t=timeLevel[k+1];
+      if ((rStep<0.5-1.0e-14)||(rStep>2.0+1.0e-14)) {
+          cout << "[time march] ERROR: invalid ratio at lev=" << lev << " k=" << k << " ratio=" << rStep << endl;
+          exit(1);
+      }
+      if (k%20==0) cout << "[lev " << lev << "] k=" << k << " t=" << t
+                        << " dtCur=" << dtCur << " rStep=" << rStep << " Nx=" << Nx << endl;
+
+      u1star=(1.0+rStep)*u1n-rStep*u1nm1;
+      u2star=(1.0+rStep)*u2n-rStep*u2nm1;
+      real alphaStar=(1.0+rStep)*Mn-rStep*Mnm1;
+      real betaStar=(1.0+rStep)*BauxN-rStep*BauxNm1;
+
+      // Residual viscosity is evaluated at known t^k, never with next-step dtCur.
+      tauR1=dtLevel[k-1];
+      tauR2=(k>=2)?dtLevel[k-2]:tauR1;
+      tauR3=(k>=3)?dtLevel[k-3]:tauR2;
+      rvOrder=min(3,k); tRv=timeLevel[k];
+      muF=muExact(x,y,tRv); f1RV=f21Exact(x,y,tRv); f2RV=f22Exact(x,y,tRv);
+      ComputeResidualViscosity(
+          Th,S2h,u1n,u2n,pn,rhoN,muF,f1RV,f2RV,
+          u1nm1,u2nm1,rhoNm1,u1nm2,u2nm2,rhoNm2,u1nm3,u2nm3,rhoNm3,
+          tauR1,tauR2,tauR3,Cflat,Cmax,hRV,
+          histInfRhoU,histInfRhoUU,histInfU,
+          Kappa,AlphaFinal,RatioRho,RatioMom,RatioDiv,AlphaRaw,rvOrder
+      );
+
+      uMagK=sqrt(u1star*u1star+u2star*u2star)+epsU;
+      gammaGD=Cgamma*hK*rhoN*(uMagK+1.0e-6);
+      solve RhotildeSys2(rhotilde,qs,solver=UMFPACK) =
+          int2d(Th,qforder=10)(
+              (rhotilde/dtCur)*qs-rhotilde*(u1star*dx(qs)+u2star*dy(qs))
+              +Kappa*(dx(rhotilde)*dx(qs)+dy(rhotilde)*dy(qs)))
+        + int1d(Th,1,qforder=10)(max(u1star*N.x+u2star*N.y,0.0)*rhotilde*qs)
+        + int1d(Th,1,qforder=10)(min(u1star*N.x+u2star*N.y,0.0)*rhoExact(x,y,t)*qs)
+        - int2d(Th,qforder=10)((rhotildeN/dtCur)*qs);
+      rhotildehat=rhotilde-filterCoef*(rhotilde-(1.0+rStep)*rhotildeN+rStep*rhotildeNm1);
+
+      {
+          real Fproj=0.0;
+          BezierMassProjectClipP3(rhotildehat,rho,rho0min,rho0max,M0h,xi,xiIters,Fproj);
+          if (lev==L-1) {
+              fN << t << "\t" << xiIters << "\t" << Fproj << "\t" << xi << "\n";
+              fN.flush;
+          }
+          sig=sqrt(rho);
+      }
+
+      muF=muExact(x,y,t);
+      solve MomSys2([uhat1,uhat2,p],[uu1,uu2,pp]) =
+          int2d(Th,qforder=10)(
+              betaStar*(sig*sig/dtCur)*(uhat1*uu1+uhat2*uu2)
+            + alphaStar*muF*Grad(uhat1,uhat2)'*Grad(uu1,uu2)
+            + ConvSkew(rho,u1star,u2star,uhat1,uhat2,uu1,uu2)
+            -p*div(uu1,uu2)+pp*div(uhat1,uhat2)+p*pp*epsp
+            +gammaGD*div(uhat1,uhat2)*div(uu1,uu2))
+        + on(1,uhat1=u1Exact(x,y,t),uhat2=u2Exact(x,y,t))
+        + int2d(Th,qforder=10)(
+              betaU*Kappa*rho*(2.0*dx(uhat1)*dx(uu1)+2.0*dy(uhat2)*dy(uu2)
+              +(dy(uhat1)+dx(uhat2))*(dy(uu1)+dx(uu2))))
+        + int2d(Th,qforder=10)(
+             -Kappa*dx(rho)*(uu1*dx(uhat1)+uu2*dx(uhat2))
+             -Kappa*dy(rho)*(uu1*dy(uhat1)+uu2*dy(uhat2))
+             +0.5*Kappa*dx(rho)*(dx(uhat1)*uu1+uhat1*dx(uu1)+dx(uhat2)*uu2+uhat2*dx(uu2))
+             +0.5*Kappa*dy(rho)*(dy(uhat1)*uu1+uhat1*dy(uu1)+dy(uhat2)*uu2+uhat2*dy(uu2)))
+        - int2d(Th,qforder=10)(
+              betaStar*(sig*sigN/dtCur)*(u1n*uu1+u2n*uu2)
+             +alphaStar*convone(muF,u1star,u2star,uu1,uu2)
+             +f21Exact(x,y,t)*uu1+f22Exact(x,y,t)*uu2);
+
+      w1=sig*uhat1; w2=sig*uhat2;
+      what1=w1-filterCoef*(w1-(1.0+rStep)*sigN*u1n+rStep*sigNm1*u1nm1);
+      what2=w2-filterCoef*(w2-(1.0+rStep)*sigN*u2n+rStep*sigNm1*u2nm1);
+      uTF1=what1/sig; uTF2=what2/sig; pTF=p;
+
+      BM0=int2d(Th,qforder=10)(2.0*muF*(sqr(e11(uTF1,uTF2))+sqr(e22(uTF1,uTF2))+2.0*sqr(e12(uTF1,uTF2))));
+      BM1=int2d(Th,qforder=10)(-muF*Grad(uhat1,uhat2)'*Grad(uhat1,uhat2)+convone(muF,u1star,u2star,uhat1,uhat2));
+      M=Mn+Qcsav*dtCur*(-BM0-alphaStar*BM1);
+      MTF=M-filterCoef*(M-(1.0+rStep)*Mn+rStep*Mnm1);
+
+      real d20=(1.0+2.0*rStep)/(1.0+rStep), d21=rStep/(1.0+rStep);
+      D2w1=d20*(what1-sigN*u1n)/dtCur-d21*(sigN*u1n-sigNm1*u1nm1)/dtPrev;
+      D2w2=d20*(what2-sigN*u2n)/dtCur-d21*(sigN*u2n-sigNm1*u2nm1)/dtPrev;
+      real normWNew=int2d(Th,qforder=qOrd)(sqr(what1)+sqr(what2));
+      real normWN=int2d(Th,qforder=qOrd)(sqr(sigN*u1n)+sqr(sigN*u2n));
+      real normWNm1=int2d(Th,qforder=qOrd)(sqr(sigNm1*u1nm1)+sqr(sigNm1*u2nm1));
+      real D2NormW=d20*(normWNew-normWN)/dtCur-d21*(normWN-normWNm1)/dtPrev;
+      real D2wWHat=int2d(Th,qforder=qOrd)(D2w1*w1+D2w2*w2);
+      BauxHat=BauxN+Zbeta*dtCur*(-0.5*D2NormW+betaStar*D2wWHat);
+      BauxTF=BauxHat-filterCoef*(BauxHat-(1.0+rStep)*BauxN+rStep*BauxNm1);
+
+      alphaErr=abs(MTF-1.0); betaErr=abs(BauxTF-1.0);
+      alphaErrSup=max(alphaErrSup,alphaErr); betaErrSup=max(betaErrSup,betaErr);
+      // alphaErrL2+=dtCur*sqr(alphaErr); betaErrL2+=dtCur*sqr(betaErr);
+
+      // beta, energy and force work are computed before any history is overwritten.
+      /*PowerF=int2d(Th,qforder=qOrd)(f21Exact(x,y,t)*uhat1+f22Exact(x,y,t)*uhat2);
+      WorkInc=dtCur*PowerF; WorkCum+=WorkInc;
+      BezierMassP3(rho,Massh0); mResh0=Massh0-M0h;
+      RhoPhysicalMinMax(rho,rhoPhysMin,rhoPhysMax);
+      Em1=0.5*normWNew; Em2=MTF/Qcsav; Em3=(BauxTF-1.0)/Zbeta; Em=Em1+Em2+Em3;
+      KappaMin=Kappa[].min; KappaMax=Kappa[].max; kIdx=k+1;
+      fTS << lev << "\t" << Nt << "\t" << kIdx << "\t" << t
+          << "\t" << dtCur << "\t" << rStep
+          << "\t" << Massh0 << "\t" << mResh0 << "\t" << rhoPhysMin << "\t" << rhoPhysMax
+          << "\t" << MTF << "\t" << BauxTF
+          << "\t" << Em1 << "\t" << Em2 << "\t" << Em3 << "\t" << Em
+          << "\t" << PowerF << "\t" << WorkInc << "\t" << WorkCum
+          << "\t" << KappaMin << "\t" << KappaMax << "\n";
+      fTS.flush;*/
+
+      u1nm3=u1nm2; u2nm3=u2nm2; u1nm2=u1nm1; u2nm2=u2nm1;
+      sigNm1=sigN; sigN=sig; u1nm1=u1n; u2nm1=u2n; u1n=uTF1; u2n=uTF2;
+      pnm1[]=pn[]; pn[]=pTF[]; Mnm1=Mn; Mn=MTF; BauxNm1=BauxN; BauxN=BauxTF;
+      rhoNm3=rhoNm2; rhoNm2=rhoNm1; rhoNm1=rhoN; rhoN=rho;
+      rhotildeNm1=rhotildeN; rhotildeN=rho;
+  }
+
+  real TimeMarchCPU=clock()-timeMarchCpuStart;
+    
+  // ----- errors and rates at final time (per level) -----
+    real areaTh = int2d(Th)(1.0);
+
+    Qh ep; ep = pTF - pExact(x,y,t);
+    real epmean = int2d(Th)(ep)/areaTh;
+    real eL2p = sqrt( int2d(Th, qforder=10)( sqr(ep - epmean) ) );
+	// real eH1p = sqrt( int2d(Th, qforder=10)( sqr(ep - epmean) 
+	                                        // + sqr(pdx(x,y,t) - dx(pTF)) 
+											// +sqr(pdy(x,y,t) - dy(pTF)) ) );
+
+    real eL2u  = sqrt( int2d(Th, qforder=10)( sqr(u1Exact(x,y,t)-uTF1) + sqr(u2Exact(x,y,t)-uTF2) ) );
+    real eH1u  = sqrt( int2d(Th, qforder=10)(
+         sqr(u1Exact(x,y,t)-uTF1) + sqr(u2Exact(x,y,t)-uTF2)
+       + sqr(u1dx(x,y,t)-dx(uTF1)) + sqr(u1dy(x,y,t)-dy(uTF1))
+       + sqr(u2dx(x,y,t)-dx(uTF2)) + sqr(u2dy(x,y,t)-dy(uTF2)) ) );
+    real eDivL2 = sqrt(
+    int2d(Th, qforder=10)(
+        sqr(
+              (u1dx(x,y,t) + u2dy(x,y,t))
+            - (dx(uTF1) + dy(uTF2))
+        )
+            )
+        );
+
+    // Discrete H^{-1} norm of the divergence error.  The auxiliary
+    // Poisson problem realizes the dual norm with respect to H_0^1.
+    solve DivHm1Problem(phiDivHm1, testDivHm1, solver=UMFPACK) =
+          int2d(Th, qforder=10)(
+              dx(phiDivHm1)*dx(testDivHm1)
+            + dy(phiDivHm1)*dy(testDivHm1)
+          )
+        - int2d(Th, qforder=10)(
+            (
+                (u1dx(x,y,t) + u2dy(x,y,t))
+              - (dx(uTF1) + dy(uTF2))
+            ) * testDivHm1
+          )
+        + on(1, phiDivHm1=0.0);
+
+    real eDivHm1Sq = int2d(Th, qforder=10)(
+          sqr(dx(phiDivHm1)) + sqr(dy(phiDivHm1))
+        );
+    real eDivHm1 = sqrt(abs(eDivHm1Sq));
+
+    real eL2rho = sqrt( int2d(Th, qforder=10)( sqr(rho - rhoExact(x,y,t)) ) );
+	// real eH1rho = sqrt( int2d(Th, qforder=10)( sqr(rho - rhoExact(x,y,t)) 
+	                              // + sqr( rhodx(x,y,t) -dx(rho) )
+								  // + sqr( rhody(x,y,t) -dy(rho) )  ) );
+
+
+
+    real alphaLinf=alphaErrSup;
+    // real alphaL2=sqrt(alphaErrL2/(Tend-T0));
+    real betaLinf=betaErrSup;
+    // real betaL2=sqrt(betaErrL2/(Tend-T0));
+
+    real rL2u=0.0,rH1u=0.0,rDivL2=0.0,rDivHm1=0.0;
+    real rL2p=0.0,rL2rho=0.0;
+    // real rH1p=0.0,rH1rho=0.0;
+    real rAlphaLinf=0.0,rBetaLinf=0.0;
+    // real rAlphaL2=0.0,rBetaL2=0.0;
+
+    if ((lev>0)&&(prevTauMax>0.0)) {
+        real denom=log(prevTauMax/tauMaxLev);
+        if (abs(denom)>=1.0e-14) {
+            if ((prevL2>0.0)&&(eL2u>0.0)) rL2u=log(prevL2/eL2u)/denom;
+            if ((prevH1>0.0)&&(eH1u>0.0)) rH1u=log(prevH1/eH1u)/denom;
+            if ((prevDivL2>0.0)&&(eDivL2>0.0)) rDivL2=log(prevDivL2/eDivL2)/denom;
+            if ((prevDivHm1>0.0)&&(eDivHm1>0.0)) rDivHm1=log(prevDivHm1/eDivHm1)/denom;
+            if ((prevP>0.0)&&(eL2p>0.0)) rL2p=log(prevP/eL2p)/denom;
+            // if ((prevPH1>0.0)&&(eH1p>0.0)) rH1p=log(prevPH1/eH1p)/denom;
+            if ((prevRho>0.0)&&(eL2rho>0.0)) rL2rho=log(prevRho/eL2rho)/denom;
+            // if ((prevRhoH1>0.0)&&(eH1rho>0.0)) rH1rho=log(prevRhoH1/eH1rho)/denom;
+            if ((prevAlphaInf>0.0)&&(alphaLinf>0.0)) rAlphaLinf=log(prevAlphaInf/alphaLinf)/denom;
+            // if ((prevAlphaL2>0.0)&&(alphaL2>0.0)) rAlphaL2=log(prevAlphaL2/alphaL2)/denom;
+            if ((prevBetaInf>0.0)&&(betaLinf>0.0)) rBetaLinf=log(prevBetaInf/betaLinf)/denom;
+            // if ((prevBetaL2>0.0)&&(betaL2>0.0)) rBetaL2=log(prevBetaL2/betaL2)/denom;
+        }
+    }
+
+    cout << "[lev " << lev << "] Nx=" << Nx << " Nt=" << Nt
+         << " tauMin=" << tauMinLev << " tauMax=" << tauMaxLev
+         << " eL2u=" << eL2u << " eH1u=" << eH1u
+         << " eDivL2=" << eDivL2 << " eDivHm1=" << eDivHm1
+         << " eL2p=" << eL2p
+         // << " eH1p=" << eH1p
+         << " eL2rho=" << eL2rho
+         // << " eH1rho=" << eH1rho
+         << " alphaLinf=" << alphaLinf
+         // << " alphaL2=" << alphaL2
+         << " betaLinf=" << betaLinf
+         // << " betaL2=" << betaL2
+         << endl;
+    cout << "rates (tauMax): ruL2=" << rL2u << ", ruH1=" << rH1u
+         << ", rdivL2=" << rDivL2 << ", rdivHm1=" << rDivHm1
+         << ", rpL2=" << rL2p
+         // << ", rpH1=" << rH1p
+         << ", rrhoL2=" << rL2rho
+         // << ", rrhoH1=" << rH1rho
+         << ", rAlphaLinf=" << rAlphaLinf
+         // << ", rAlphaL2=" << rAlphaL2
+         << ", rBetaLinf=" << rBetaLinf
+         // << ", rBetaL2=" << rBetaL2
+         << endl;
+
+    fupK << Nx << "\t&\t" << Nt << "\t&\t" << h << "\t&\t" << tauMaxLev
+         << "\t&\t" << eL2u << "\t&\t" << rL2u
+         << "\t&\t" << eH1u << "\t&\t" << rH1u
+         << "\t&\t" << eDivL2 << "\t&\t" << rDivL2
+         << "\t&\t" << eDivHm1 << "\t&\t" << rDivHm1
+         << "\t&\t" << eL2p << "\t&\t" << rL2p
+         // << "\t&\t" << eH1p << "\t&\t" << rH1p
+         << "\t&\t" << eL2rho << "\t&\t" << rL2rho
+         // << "\t&\t" << eH1rho << "\t&\t" << rH1rho
+         << "\t&\t" << alphaLinf << "\t&\t" << rAlphaLinf
+         // << "\t&\t" << alphaL2 << "\t&\t" << rAlphaL2
+         << "\t&\t" << betaLinf << "\t&\t" << rBetaLinf
+         // << "\t&\t" << betaL2 << "\t&\t" << rBetaL2
+         << "\t\\ \\hline" << endl;
+    fupK.flush;
+
+    real LevelCPU=clock()-levCpuStart;
+    real CPUPerStep=TimeMarchCPU/Nt;
+    fCPU << lev << "\t" << Nt << "\t" << Nx
+         << "\t" << tauMinLev << "\t" << tauMaxLev
+         << "\t" << ratioMinLev << "\t" << ratioMaxLev
+         << "\t" << TimeMarchCPU << "\t" << LevelCPU << "\t" << CPUPerStep << "\n";
+    fCPU.flush;
+
+    prevTauMax=tauMaxLev;
+    prevL2=eL2u; prevH1=eH1u;
+    prevDivL2=eDivL2; prevDivHm1=eDivHm1;
+    prevP=eL2p;
+    // prevPH1=eH1p;
+    prevRho=eL2rho;
+    // prevRhoH1=eH1rho;
+    prevAlphaInf=alphaLinf;
+    // prevAlphaL2=alphaL2;
+    prevBetaInf=betaLinf;
+    // prevBetaL2=betaL2;
+} // refinement loop
+
+real totalCpuSeconds = clock() - totalCpuStart;
+cout << "[timing] total_cpu_seconds=" << totalCpuSeconds << endl;
+fupK << "% total_cpu_seconds=" << totalCpuSeconds << endl;
+fupK.flush;
+fCPU << "total_cpu_seconds\t" << totalCpuSeconds << "\n";
+fCPU.flush;
