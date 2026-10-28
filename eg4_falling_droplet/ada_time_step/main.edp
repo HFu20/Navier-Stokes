@@ -1,0 +1,1238 @@
+//====================================================================
+// Falling droplet: variable-step alpha-beta structure-preserving scheme
+//====================================================================
+include "ffmatlib.idp"
+include "NewViscosity.idp"
+load "UMFPACK64"
+load "Element_Mixte"
+load "Element_P3"
+
+
+// ---------- parameters ----------
+real T0 = 0.0, Tend = 1.301;
+
+real xmin = 0.0, xmax = 1.0;
+real ymin = 0.7, ymax = 2.0; 
+
+int  Nxbot =100;       // boundary points for top and bottom
+int  Nxleft =130 ;       // boundary points for left and right     // boundary points for left and right
+
+
+real histInfRhoU  = 1.0e-16;
+real histInfRhoUU = 1.0e-16;
+real histInfU     = 1.0e-16;
+
+
+//real  dt = 0.0005;
+//real h  = 0.01/100;
+//int  nSteps = Tend/dt;     
+int  nSave  = 50;      
+int  printEvery = 5;
+int  Itenum = 1e3;    // max iterations for projection
+int qOrdDiag = 10;
+
+real Qcsav = 1e-5; // alpha auxiliary-variable coefficient
+real Zbeta = 1e-5; // beta auxiliary-variable coefficient
+real tol  = 1e-13;    // tolerance for projection Newton
+
+// --- Adaptive Mesh Parameters ---
+real thetaAdapt = 0.65;    
+real hminSim = 1.0/150;        
+real hmaxSim = 1.0/50;         
+int adaptInterval = 50;
+int lastAdaptStep = 0;
+//real adaptBuffer = 10.0*dt;
+
+real[int] saveTimes(7);
+saveTimes[0] = 0.1;
+saveTimes[1] = 1.0;
+saveTimes[2] = 1.1;
+saveTimes[3] = 1.3;
+saveTimes[4] = 2.2;
+saveTimes[5] = 3.0; 
+saveTimes[6] = 0.5; 
+
+// adaptive time step
+real t,tau,dt;
+real dtmax = 1.0e-3;
+real dtmin = 1.0e-5;
+// dtvar-only adaptive controller parameters.
+real kappaAda = 1.3;
+
+
+/* Kappa Parameters */
+real Cflat = 0.1;
+real Cmax = 1.0;
+real betaU = 1.0;
+
+string fTSName = "timeseries_Rays1.txt";
+string fNName = "NewtonData.txt";
+string fCName = "CFL.txt";
+string fAdaName = "adaptive_controller_new.tsv";
+string fCpuName = "cpu_time.tsv";
+
+ofstream fTS(fTSName);
+fTS.precision(16);
+
+fTS  << "k\tt\t1Mass\t2MassResidual\t3alphaMinus1\t4rhoMin\t5rhoMax"
+     << "\t6LegacyEhat\t7Eref\t8Eg\t9Diss\t10LegacyDE"
+     << "\t11LegacyAlphaOverQ\t12TEg\t13LegacyAlphaEnergy\t14LegacyVelocityEnergy"
+     << "\t15alpha\t16beta\t17Em1\t18Em2\t19Em3\t20Em\n";
+
+ofstream fN(fNName);
+fN.precision(16);
+fN  << "t\t xiIters\t F\t xi\n";
+
+
+ofstream fC(fCName);
+fC.precision(16);
+fC  << "k\t t\t CFLmax\t umax\t hKmin"<< endl;
+fC.flush;
+
+ofstream fAda(fAdaName);
+fAda.precision(16);
+fAda << "step\tt\tdt\tr\tEnCurrent\tEnPrev\tdEnDt\tCadv\tCadvCrit"
+     << "\ttauVarRaw\ttauVar\tdtNext"
+     << "\tdtNextOverDtMin\ttauVarRawOverDtMin\tratioNext"
+     << "\tfinalLimiter\n";
+
+ofstream fCpu(fCpuName);
+fCpu.precision(16);
+fCpu << "recordType\tstep\tt\tdt\tcpuElapsed\ttotalCpuTime\n";
+real cpuStart = clock();
+
+
+// solve params
+real epsp = 1e-14; //1e-10;   // pressure stabilization
+//real gammaGD = 1e-2;  // optional grad-div
+real tinyDrag = 0.0; // optional linear drag
+
+// initial scalars
+real Mn = 1.0, Mhat=1.0;
+real BauxN = 1.0, BauxHat = 1.0, BauxTF = 1.0;
+real Kn = 1.0, Khat=1.0;
+real Qn = 1.0, Qhat=1.0;
+real  MTF=1.0; 
+real  KTF=1.0;
+real  QTF=1.0;
+int  kIdx = 0;
+real ErefPrev = 0.0;
+
+// ---------- exact / manufactured solution ----------
+real epsR = 1e-8;
+
+real Re   = 3132.0;
+real gY   = -1.0;
+real nu   = 1.0/Re; 
+
+real rhoHeavy = 100.0;  
+real rhoLight = 1.0;
+
+real a = 1.0;
+
+real xcBubble = 0.5;
+real ycBubble = 1.75;
+real rBubble  = 0.2;
+
+func real rhoInitialDiscontinuous(real xx, real yy){
+    real rr = sqrt((xx-xcBubble)^2 + (yy-ycBubble)^2);
+    return ((yy <= 1.0) || (rr <= rBubble)) ? rhoHeavy : rhoLight;
+}
+
+/*real xcBubble = 0.5;
+real ycBubble = 1.75;
+real rBubble  = 0.2;
+
+func real rhoInitialDiscontinuous(real xx, real yy){
+    real rr = sqrt((xx-xcBubble)^2 + (yy-ycBubble)^2);
+    return ((yy <= 1.0) || (rr <= rBubble)) ? rhoHeavy : rhoLight;
+}*/
+
+
+
+
+// viscosity 
+/*func real muExact(real r){ 
+          
+       return nu;  
+}*/
+real mu = nu;
+
+
+
+// ---------- body force (includes grad p) ----------
+func real f21Exact(real x, real y, real t){
+   return 0;
+}
+func real f22Exact(real r){
+    return r*gY;
+  //return 0;
+}
+
+// ---------- macros ----------
+macro Grad(u1,u2) [dx(u1), dy(u1), dx(u2), dy(u2)]//
+macro div(u1,u2)  (dx(u1) + dy(u2))//
+macro e11(u1, u2) dx(u1) // 
+macro e22(u1, u2) dy(u2) // 
+macro e12(u1, u2) (0.5 * (dy(u1) + dx(u2))) //
+// Convective skew form
+macro ConvSkew(rho,a1,a2,b1,b2,V1,V2)
+( (rho)*(a1*dx(b1)+a2*dy(b1))*V1
++ (rho)*(a1*dx(b2)+a2*dy(b2))*V2
++ 0.5*( dx(rho)*a1 + (rho)*dx(a1) + dy(rho)*a2 + (rho)*dy(a2) )*( b1*V1 + b2*V2 ) ) //
+
+macro convone(mu,b1,b2,v1,v2)
+( ( dx(b1)*dx(mu) + dx(b2)*dy(mu) )*v1 + ( dy(b1)*dx(mu) + dy(b2)*dy(mu) )*v2 )//
+
+macro convoneKrho(Kappa,rho,b1,b2,v1,v2)
+( ( dx(b1)*( dx(Kappa)*rho+Kappa*dx(rho) ) + dx(b2)*( dy(Kappa)*rho+Kappa*dy(rho) ) )*v1 
+ + ( dy(b1)*( dx(Kappa)*rho+Kappa*dx(rho) ) + dy(b2)*( dy(Kappa)*rho+Kappa*dy(rho) ) )*v2 )//
+
+
+macro ProjectToRT(uin, vin,uRT1,uRT2)
+    {
+        solve ProjectionRT([uRT1, uRT2, phiProj], [vrt1, vrt2, qProj], solver=UMFPACK) =
+            int2d(Th)( [uRT1, uRT2]' * [vrt1, vrt2] )			
+            + int2d(Th)( phiProj * (dx(vrt1) + dy(vrt2)) )
+            + int2d(Th)( qProj * (dx(uRT1) + dy(uRT2)) )
+            - int2d(Th)( [uin, vin]' * [vrt1, vrt2] )
+			+ on(1, 2, 3, 4, uRT1=uin, uRT2=vin);
+    }
+// End macro
+
+/*macro ConvSkew1(rho,a1,a2,b1,b2,V1,V2)
+( (rho)*(a1*dx(b1)+a2*dy(b1))*V1
++ (rho)*(a1*dx(b2)+a2*dy(b2))*V2
++ 0.25*( (rho)*dx(a1) + (rho)*dy(a2) )*( b1*V1 + b2*V2 ) ) //*/
+
+// 1. (Scalar Symmetrization)
+// f(x) = f(-x)
+// symmetry is about x = 0.5, i.e. x <-> 1-x
+
+// ---------- I/O ----------
+//real nuVal = muExact(inrho(0,0.0075));
+cout << "[params] Qcsav=" << Qcsav
+     << "  Zbeta=" << Zbeta
+     << "  dtmax=" << dtmax
+     << "  dtmin=" << dtmin
+     << "  kappaAda=" << kappaAda
+     << "  T0="   << T0
+     << "  Tend=" << Tend
+     << "  nu="   << nu
+	 << "  cflact="  << Cflat
+	 << "  cmax=" << Cmax
+	 << endl;
+     //<< "  gammaGD=" << gammaGD << endl;
+
+string fMName = "Merror.txt";
+string fdtName = "dt_vs_time.txt";
+ofstream fM(fMName);
+fM << "Merror" << endl;
+ofstream fdt(fdtName);
+fdt << "t\tdt\tdtNext\ttauVarRaw\ttauVar\tCadv\tCadvCrit"
+     << "\tfinalLimiter" << endl;
+
+// ---- projection scalars (once per level) ----
+int  qOrd = 10;   // quadrature for energy and diagnostics
+real xi   = 0.0;  // Lagrange multiplier
+int  xiIters = 0; // iteration count
+
+
+
+// Use 'square' for easy periodic boundary definition
+mesh Th = square(Nxbot, Nxleft, [xmin+(xmax-xmin)*x, ymin+(ymax-ymin)*y],flags=1);
+
+/*cout << "--- Initial Adaptation ---" << endl;
+for (int iadapt = 0; iadapt < 1; ++iadapt) {
+    fespace Phinit(Th, P2);
+    Phinit rhoInit = inrho(x,y);
+    Th = adaptmesh(Th, rhoInit, err=5e-4, hmin=hminSim, hmax=hmaxSim, ratio=1.15, nbvx=200000);
+}*/
+
+
+
+ 
+// Labels 2 (right) and 4 (left) are periodic
+  fespace Xh(Th, [P3,P3,P2]);
+fespace Vh(Th, P3);
+fespace Qh(Th, P2);
+fespace S2h(Th, P3); // for scalars like density
+fespace P0h(Th, P0);// for cell-wise constants like hK, tauK
+  //fespace S2h(Th, P2, periodic=[[2,y],[4,y]]);
+  //fespace P0mac(Th, P1dc); //for RT macro
+  //P0mac phiProj, qProj;
+  //fespace VhP1(Th, P1);
+ 
+  include "BezierP3Limiter.idp"
+
+nBezierDof = S2h.ndof;
+Wb.resize(nBezierDof);
+
+BuildBezierDofKP3(Th, S2h, BezierDofKP3);
+BuildBezierWeightsP3(BezierDofKP3, Wb);
+
+
+S2h hRV, hTest;
+
+P0h areaK = area;
+int polyDegRV = 3;
+
+solve SmoothMeshSize(hRV, hTest, solver=UMFPACK) =
+      int2d(Th, qforder=8)(
+          hRV*hTest
+        + areaK*(dx(hRV)*dx(hTest) + dy(hRV)*dy(hTest))
+      )
+    - int2d(Th, qforder=8)(
+          sqrt(areaK)/polyDegRV*hTest
+      );
+
+cout << "[hRV] min=" << hRV[].min
+     << " max=" << hRV[].max
+     << " mean approximately=" << hRV[].sum/hRV[].n
+     << endl;
+    
+ 
+  
+  // Matrices and Linear Algebra
+  matrix Mp, Msh;
+  real[int] ML;
+
+  matrix Aalpha;
+ S2h AlphaRaw;
+
+  varf vAlphaL(a,b) =
+    int2d(Th, qforder=10)(
+        a*b
+      + square(hRV)*(dx(a)*dx(b) + dy(a)*dy(b))
+    );
+    varf vAlphaR(a,b) =
+    int2d(Th, qforder=8)(
+        AlphaRaw*b
+    );
+macro BuildAlphaMatrix(S2h) {
+    Aalpha = vAlphaL(S2h, S2h);
+    set(Aalpha, solver=UMFPACK);
+} //
+
+  BuildAlphaMatrix(S2h);
+
+
+/* pressure mass matrix Mp */
+/*{
+varf vMp(p,q) = int2d(Th)( p*q );
+ Mp = vMp(Qh,Qh);
+set(Mp, solver=UMFPACK);
+}*/
+
+
+  // fields
+  // Momentum variables (Composite)
+  Xh [u1hat, u2hat, p], [uu1, uu2, pp];          // Current step, Test functions
+  Xh [uTF1, uTF2, pTF];                 // Filtered step
+  Xh [u1n, u2n, pn], [u1nm1, u2nm1, pnm1]; // History steps
+  Xh [u1nm2, u2nm2, pnm2];              // For 3rd order extrapolation
+  Xh [u1nm3, u2nm3, pnm3];
+  //Xh [u1star, u2star, pstar];              // Extrapolated steps
+  //Vh u1hat,u2hat, uTF1,uTF2,u1n,u2n, u1nm1,u2nm1, uu1,uu2, u1star, u2star,w1,w2,wTF1,wTF2;
+  Vh u1star, u2star;
+  Vh u1RhoAdvN, u2RhoAdvN;
+  Vh w1,w2,wTF1,wTF2,D2w1,D2w2;
+  //Qh p,pp,pTF,pn,pnm1,pstar;
+  S2h sig, sigN, sigNm1,sigNm2,sigNm3, sigTF, sigTFN, sigTFNm1,
+     rho, rhoN, rhoNm1, rhotilde, rhotildeTF, rhotildeN, rhotildeNm1, muF, divUnF, qs;  //
+  S2h rhoBE; S2h rhoNm3; S2h rhoNm2, rhotildeNm2;
+  S2h rhotildeTFNm3, rhotildeTFNm2, rhotildeTFNm1, rhotildeTFN;
+  S2h rhotildeNm3;
+  P0h hK = hTriangle, tauK, uMagK; //the coefficient of SUPG
+  P0h nudc,cflField;
+  P0h gr;
+  P0h rr;
+  P0h cap;
+  P0h gr2;
+  P0h rr2;
+  P0h cap2;
+  S2h gammaGD;
+  S2h divuRT,divuTF,divunonTF;
+  //Vh uRT1, uRT2;
+  S2h q;
+   //Vh u1nm2, u2nm2;
+ 
+  S2h Kappa;
+  S2h AlphaFinal;
+  S2h KappaSym;
+   S2h rhoClip, indClip;
+  S2h RatioRho,RatioMom,RatioDiv;
+  S2h ResRhoDiag, nRhoFinalDiag;
+  S2h RhoDtDiag, RhoAdvDiag, RhoDivDiag;
+ 
+
+ffSaveVh(Th,S2h,"fespace_S2h.txt");
+savemesh(Th,"FB2D.msh");
+
+S2h rhoRaw0, rho0h;
+
+real sigmaIC = 7.0;
+
+  rhoRaw0 = rhoInitialDiscontinuous(x,y);
+
+solve SmoothInitialDensity(rho0h, qs, solver=UMFPACK) =
+      int2d(Th, qforder=8)( rho0h*qs
+          + sigmaIC*hRV*hRV*(dx(rho0h)*dx(qs)+dy(rho0h)*dy(qs)) )
+    - int2d(Th, qforder=8)( rhoRaw0*qs );
+
+  // initial data at t0
+  t = T0;
+
+ // S2h rho0h = inrho(x,y);
+  real rho0min = rhoLight;
+  real rho0max = rhoHeavy;
+  real rhoPhysMin = 0.0;
+  real rhoPhysMax = 0.0;
+  BezierClipP3(rho0h, rho0min, rho0max);
+  
+  //u1n = 0.0; u2n = 0.0;
+  //u1nm1 = u1n; u2nm1 = u2n; 
+  rho = rho0h;
+  rhoN = rho; rhoNm1 = rho;
+  rhoNm2 = rho; rhoNm3 = rho; 
+   rhoBE = rho0h;
+  rhotilde = rho0h;
+  rhotildeN = rhotilde; rhotildeNm1 = rho; rhotildeNm2 = rho; rhotildeNm3 = rho; 
+  rhotildeTF = rhotilde;
+rhotildeTFN = rhotilde;
+rhotildeTFNm1 = rhotilde;
+rhotildeTFNm2 = rhotilde;
+rhotildeTFNm3 = rhotilde;
+u1RhoAdvN = u1n;
+u2RhoAdvN = u2n;
+
+  //pn = 0.0; pnm1 = pn;
+  
+  [u1n, u2n, pn] = [0, 0, 0];
+  [u1nm1, u2nm1, pnm1] = [0, 0, 0];
+  [u1nm2, u2nm2, pnm2] = [0, 0, 0];
+  [u1nm3, u2nm3, pnm3] = [0, 0, 0];
+
+  sigN = sqrt( rho );
+  sigNm1 = sigN;sigNm2 = sigN;
+sigNm3 = sigN;
+  sig = sigN;
+  [u1hat,u2hat,p] = [0,0,0];
+  [uTF1, uTF2, pTF] = [0, 0, 0];
+
+  real Mnm1 = 1.0;
+  real BauxNm1 = 1.0;
+  real Knm1 = 1.0;
+  real Qnm1 = 1.0;
+
+  // --------- build consistent P1 mass weights ML ----------
+  /*{
+  varf vM(u,v) = int2d(Th)( u*v );
+   Msh = vM(Sh,Sh);        // consistent mass matrix
+   ML.resize(Sh.ndof);
+  real[int] ones(Sh.ndof); ones = 1;
+   ML = Msh * ones;     // ML[i] = int phi_i
+  }*/
+
+  // mass baselines FIRST
+  int qOrdM = 10;
+  //real Mreal = int2d(Th, qforder=qOrdM)( rho0h );
+  //real M0 = int2d(Th, qforder=qOrdM)( rho0h );
+  real M0h = 0.0;
+  real Massh0 = 0.0;
+  real MassBefore = 0.0;
+  real MassAfter  = 0.0;
+  BezierMassP3(rho0h, M0h);
+  cout << "Target Mass M0h = " << M0h << endl;
+  real Em1 = 0.0, Em2 = 0.0, Em3 = 0.0, Em = 0.0;
+
+  //real Massh0 = 0.0; for (int i=0;i<Sh.ndof;++i) Massh0 += ML[i]*rho[][i];
+
+ // ===== log initial state (k=0) =====
+  kIdx = 0;
+  real EkInit = 0.5* int2d(Th, qforder=qOrd)( (sig*sig)*(u1n*u1n + u2n*u2n) ); 
+  //real WorkInit = int2d(Th, qforder=qOrd)( f21Exact(x,y,t) * u1n + f22Exact(x,y,t) * u2n  );
+  real Ehat = 0.5*EkInit 
+           + 0.25*int2d(Th, qforder=qOrd)( sqr(2*sig*u1n - sigN*u1nm1) + sqr(2*sig*u2n - sigN*u2nm1) )
+  		   +1.0/(2.0*Qcsav)*( (3*MTF-Mn) ) + 0.25 * int2d(Th, qforder=qOrd)( 
+                 sqr(sig*u1n - sigN*u1nm1) + 
+                 sqr(sig*u2n - sigN*u2nm1) 
+             ); 
+  real Ehatn = Ehat;
+  real Ehatu = 0.5*EkInit 
+           + 0.25*int2d(Th, qforder=qOrd)( sqr(2*sig*u1n - sigN*u1nm1) + sqr(2*sig*u2n - sigN*u2nm1) )
+		   + 0.25 * int2d(Th, qforder=qOrd)( 
+                 sqr(sig*u1n - sigN*u1nm1) + 
+                 sqr(sig*u2n - sigN*u2nm1) 
+             );
+  real Mnms = 1.0/(2.0*Qcsav)*( (3*MTF-Mn) );
+  real ErefInit = EkInit ;
+  //real EmodInit = EkInit + 1/alpha*1.0 - 1/alpha*1.0;
+  //ErefPrev = EmodInit;
+  // Gravitational power history for trapezoidal accumulation of TEg.
+  real gravityPowerPrev = int2d(Th, qforder=qOrd)(f22Exact(rho)*u2n);
+  real gravityPowerCurr = gravityPowerPrev;
+  real Eg = dt*gravityPowerPrev;
+  real TEg = 0.0;
+
+  //real Massh0 = int2d(Th, qforder=qOrd)(rho);
+  BezierMassP3(rho, Massh0);
+  real mResh0 = Massh0 - M0h;
+  //real rhoMinInit = rho[].min;
+  //real rhoMaxInit = rho[].max;
+  RhoPhysicalMinMax(rho, rhoPhysMin, rhoPhysMax);
+  real Diss = -2.0*int2d(Th, qforder=qOrd)(
+               (mu)*( sqr(dx(u1n)) + sqr(dy(u2n))
+			    + 2.0*sqr( 0.5*(dx(u2n)+dy(u1n)) ) ) );
+  real DE = ( Ehat - Ehatn - dt*Diss - Eg );
+
+  Em1 = 0.5*int2d(Th, qforder=qOrd)(sqr(sig*u1n)+sqr(sig*u2n));
+  Em2 = Mn/Qcsav;
+  Em3 = (BauxN-1.0)/Zbeta;
+  Em = Em1+Em2+Em3;
+
+
+  fTS << kIdx << "\t" << t
+      << "\t" << Massh0
+	   << "\t" << mResh0
+	   << "\t" << MTF-1.0
+	   << "\t" << rhoPhysMin
+	   << "\t" << rhoPhysMax
+      << "\t" << Ehat
+	   << "\t" << ErefInit
+	   << "\t" << Eg
+      << "\t" << Diss << "\t" << DE << "\t" << MTF/Qcsav 
+  	  << "\t" << TEg << "\t" << Mnms << "\t" << Ehatu
+      << "\t" << Mn << "\t" << BauxN
+      << "\t" << Em1 << "\t" << Em2 << "\t" << Em3 << "\t" << Em << "\n";
+
+  // SUPG parameter
+  real epsU = 1e-12;
+
+  // ===== Start-up (IMEX-1) =====
+  //real dt = dtmin;
+  dt = 0.001;
+ t += dt;
+
+
+/* Step 1: density (IMEX-1 + SUPG) */
+//P0h hSym = SymEven(hK); 
+
+// 2. (Symmetrized Velocity Magnitude)
+///P0h uMagSym = SymVelMag(u1n, u2n) + epsU;
+
+// 3.  (Symmetrized Density for Coefficients)
+//P0h rhoNSym = SymEven(rhoN);
+
+//divUnF = dx(u1nRT) + dy(u2nRT);
+uMagK  = sqrt(u1n*u1n + u2n*u2n) + epsU;
+//tauK   = 1.5 / sqrt( sqr(1.0/dt) + sqr( 2.0*uMagK/hK ) );
+//tauK   = 1.5 / sqrt( sqr(1.0/dt) + sqr( 2.0*uMagSym/hSym ) );
+real Cgamma = 200; // 20 0.5; 
+gammaGD = Cgamma * hK * rhoN * (uMagK + 1e-6);
+
+int rvOrder = min(3, 0);
+if (rvOrder < 1){ rvOrder = 1;}
+    real tRv = t - dt;
+    
+    ComputeResidualViscosity(
+        Th, S2h,
+        u1n, u2n, pn, rhoN,
+        nu,
+        f21Exact(x,y,tRv),
+        f22Exact(rhoN),
+        u1nm1, u2nm1, rhoNm1,
+        u1nm2, u2nm2, rhoNm2,
+        u1nm3, u2nm3, rhoNm3,
+        dt, dt, dt, Cflat, Cmax, hRV,
+        histInfRhoU, histInfRhoUU, histInfU,
+        Kappa, AlphaFinal,
+         RatioRho, RatioMom, RatioDiv, AlphaRaw,1,rvOrder
+    );
+  
+  /*KappaSym = max(
+    Kappa(x,y),
+    Kappa(xmin + xmax - x, y)
+);
+
+Kappa = KappaSym;*/
+  
+
+  solve RhotildeSys1( rhotilde , qs, solver=UMFPACK ) =
+        int2d(Th, qforder=8)(
+            (rhotilde/dt)*qs
+          - rhotilde * (u1n*dx(qs) + u2n*dy(qs))
+		  //- 0.5*rhotilde*( dx(u1nRT)+dy(u2nRT) )*qs
+          /*+ tauK * (u1nRT*dx(qs) + u2nRT*dy(qs)) *
+             ( (rhotilde/dt)
+             + (u1nRT*dx(rhotilde) + u2nRT*dy(rhotilde))
+             + 0.5*divUnF * rhotilde  )*/
++ Kappa * (
+     dx(rhotilde)*dx(qs) + dy(rhotilde)*dy(qs)
+  )
+        )
+      - int2d(Th, qforder=8)(
+            (rhotildeN/dt)*qs
+          //+ tauK*(u1nRT*dx(qs) + u2nRT*dy(qs)) * (rhotildeN/dt )
+        );
+
+  // structure-preserving projection at startup (discrete mass inner product)
+  {
+    //xi = 0.0;   xiIters = 0; 
+    real F = 0.0, V = 0.0;
+    BezierMassProjectClipP3(
+                  rhotilde,
+                  rho,
+                  rho0min,
+                  rho0max,
+                  M0h,
+                  xi,
+                  xiIters,
+                  F
+   );
+   cout<< " Iterations number = " << xiIters << " , F =  " << F << " , xi = " << xi << endl;
+	 fN << t << "\t" << xiIters << "\t" << F << "\t" << xi << "\n";
+    sig = sqrt(rho);
+    BezierMassP3(rhotilde, MassBefore);
+    BezierMassP3(rho, MassAfter);
+    cout << "Mass before proj = " << MassBefore
+     << ", Mass after proj = " << MassAfter
+     << ", target M0h = " << M0h
+     << ", Mass residual = " << MassAfter - M0h << endl;
+  }
+
+  //muF = muExact(rho);
+
+  // Step 1b: momentum (IMEX-1)
+  solve MomSys1([u1hat,u2hat,p],[uu1,uu2,pp]) =
+      int2d(Th,qforder=8)(
+          BauxN*((sig*sig)/dt) * (u1hat*uu1 + u2hat*uu2)
+		+ Mn*mu*Grad(u1hat,u2hat)'*Grad(uu1,uu2)
+		//+ Mn*Kappa*rho*Grad(u1hat,u2hat)'*Grad(uu1,uu2)
+		+  ConvSkew(rho, u1n, u2n, u1hat, u2hat, uu1, uu2)
+        - p*div(uu1, uu2) + pp*div(u1hat,u2hat)
+        + p*pp*epsp
+        + gammaGD * div(u1hat,u2hat) * div(uu1,uu2)
+      )
+   + int2d(Th,qforder=8)(
+        // === f_rho \cdot (\nabla u \cdot v) ===
+        -Kappa * dx(rho) * (uu1 * dx(u1hat) + uu2 * dx(u2hat)) + 
+        -Kappa * dy(rho) * (uu1 * dy(u1hat) + uu2 * dy(u2hat)) 
+        
+        // === -1/2 f_rho \cdot \nabla(u \cdot v) ===
+        + 0.5 * Kappa * dx(rho) * (dx(u1hat)*uu1 + u1hat*dx(uu1) + dx(u2hat)*uu2 + u2hat*dx(uu2))
+        + 0.5 * Kappa * dy(rho) * (dy(u1hat)*uu1 + u1hat*dy(uu1) + dy(u2hat)*uu2 + u2hat*dy(uu2))
+    )
+	 + int2d(Th,qforder=8)(
+              betaU * Kappa * rho * (
+                  2.0 * dx(u1hat)*dx(uu1) + 2.0 * dy(u2hat)*dy(uu2)
+                + (dy(u1hat) + dx(u2hat)) * (dy(uu1) + dx(uu2))
+              )
+          )
+    + on(1,3, u2hat=0.0)
+    + on(2,4, u1hat=0.0) 	
+    - int2d(Th,qforder=8)(
+          BauxN*((sig*sigN)/dt) * (u1n*uu1 + u2n*uu2)  
+        //+ Mn * convoneKrho(Kappa,rho,u1n,u2n,uu1,uu2)			
+       + f21Exact(x,y,t)*uu1 + f22Exact(rho)*uu2 );	
+//Note! for BDF1, do not use time filter(TF) for u1hat and u2hat!, which means u1hat = u1, u2hat = u2
+
+  // M update at startup
+  real BM0 = int2d(Th, qforder=10)(
+              2.0 * mu * (
+            e11(u1hat, u2hat) * e11(u1hat, u2hat) + 
+            e22(u1hat, u2hat) * e22(u1hat, u2hat) +  
+            2.0 * e12(u1hat, u2hat) * e12(u1hat, u2hat) 
+               )
+             )
+			 /*+ int1d(Th, 1,2,3,4)( 
+        - 2.0 * mu * (
+            (e11(u1hat, u2hat) * N.x + e12(u1hat, u2hat) * N.y) * u1hat 
+            +
+            (e12(u1hat, u2hat) * N.x + e22(u1hat, u2hat) * N.y) * u2hat
+        )
+		)*/;
+  real BM1 = int2d(Th, qforder=10)(
+              - mu*Grad(u1hat,u2hat)'*Grad(u1hat, u2hat)
+               //+ convone(muF,u1n, u2n, u1hat, u2hat)
+             )
+			 /*+int1d(Th, 1,2,3,4)(
+               mu * ( ( dx(u1hat)*N.x + dy(u1hat)*N.y )*u1hat + ( dx(u2hat)*N.x + dy(u2hat)*N.y )*u2hat )
+             )*/;
+  Mhat = Mn + dt * Qcsav *( -1*BM0 - Mn * BM1);
+
+  
+
+// ===== energy diagnostics at k = 1 =====
+  [uTF1,uTF2,pTF] = [u1hat,u2hat,p];
+  //uTF1 = u1hat;
+  //uTF2 = u2hat;
+  MTF = Mhat;
+  w1 = sig*uTF1;
+  w2 = sig*uTF2;
+  BauxHat = 1.0 + 0.5*Zbeta*int2d(Th, qforder=qOrd)(
+      sqr(sig*uTF1-sigN*u1n)+sqr(sig*uTF2-sigN*u2n));
+  BauxTF = BauxHat;
+  
+   kIdx = 1;
+  EkInit = 0.5* int2d(Th, qforder=qOrd)( (sig*sig)*(uTF1*uTF1 + uTF2*uTF2) ); 
+  //real WorkInit = int2d(Th, qforder=qOrd)( f21Exact(x,y,t) * u1n + f22Exact(x,y,t) * u2n  );
+  Ehat = 0.5*EkInit 
+           + 0.25*int2d(Th, qforder=qOrd)( sqr(2*sig*uTF1 - sigN*u1n) + sqr(2*sig*uTF2 - sigN*u2n) )
+  		   +1.0/(2.0*Qcsav)*( (3*MTF-Mn) ) + 0.25 * int2d(Th, qforder=qOrd)( 
+                 sqr(sig*uTF1 - sigN*u1n) + 
+                 sqr(sig*uTF2 - sigN*u2n) 
+             ); 
+  ErefInit = EkInit ;
+  Mnms = 1.0/(2.0*Qcsav)*( (3*MTF-Mn) );
+  Ehatu = 0.5*EkInit 
+           + 0.25*int2d(Th, qforder=qOrd)( sqr(2*sig*uTF1 - sigN*u1n) + sqr(2*sig*uTF2 - sigN*u2n) )
+		   + 0.25 * int2d(Th, qforder=qOrd)( 
+                 sqr(sig*uTF1 - sigN*u1n) + 
+                 sqr(sig*uTF2 - sigN*u2n) 
+             ); 
+  //real EmodInit = EkInit + 1/alpha*1.0 - 1/alpha*1.0;
+  //ErefPrev = EmodInit;
+  gravityPowerCurr = int2d(Th, qforder=qOrd)(f22Exact(rho)*u2hat);
+  Eg = dt*gravityPowerCurr;
+  TEg += 0.5*dt*(gravityPowerPrev + gravityPowerCurr);
+  gravityPowerPrev = gravityPowerCurr;
+
+  //Massh0 = int2d(Th, qforder=qOrd)(rho);
+  BezierMassP3(rho, Massh0);
+  mResh0 = Massh0 - M0h;
+  //rhoMinInit = rho[].min;
+  //rhoMaxInit = rho[].max;
+  RhoPhysicalMinMax(rho, rhoPhysMin, rhoPhysMax);
+  Diss = -2.0*int2d(Th, qforder=qOrd)(
+               (mu)*( sqr(dx(uTF1)) + sqr(dy(uTF2))
+			    + 2.0*sqr( 0.5*(dx(uTF2)+dy(uTF1)) ) ) );
+  DE = ( Ehat - Ehatn - dt*Diss - Eg );
+
+  Em1 = 0.5*int2d(Th, qforder=qOrd)(sqr(sig*uTF1)+sqr(sig*uTF2));
+  Em2 = MTF/Qcsav;
+  Em3 = (BauxTF-1.0)/Zbeta;
+  Em = Em1+Em2+Em3;
+
+
+  fTS << kIdx << "\t" << t
+      << "\t" << Massh0
+	   << "\t" << mResh0
+	   << "\t" << MTF-1.0
+	   << "\t" << rhoPhysMin
+	   << "\t" << rhoPhysMax
+      << "\t" << Ehat
+	   << "\t" << ErefInit
+	   << "\t" << Eg
+      << "\t" << Diss << "\t" << DE << "\t" << MTF/Qcsav 
+  	  << "\t" << TEg << "\t" << Mnms << "\t" << Ehatu
+      << "\t" << MTF << "\t" << BauxTF
+      << "\t" << Em1 << "\t" << Em2 << "\t" << Em3 << "\t" << Em << "\n";
+
+  // Energy-variation controller history starts from the completed IMEX-1 state.
+  real EnPrev = Em - TEg;
+
+  // roll histories
+  Ehatn = Ehat;
+
+  // roll histories
+  //u1nm2 = u1nm1; u2nm2 = u2nm1;
+  [u1nm3, u2nm3, pnm3] = [u1nm2, u2nm2, pnm2];
+  [u1nm2, u2nm2, pnm2] = [u1nm1, u2nm1, pnm1];
+  [u1nm1, u2nm1, pnm1] = [u1n, u2n, pn];
+  [u1n, u2n, pn]       = [u1hat, u2hat, p];
+  //u1nm1 = u1n; u2nm1 = u2n;
+  //u1n   = u1hat;  u2n   = u2hat;
+  //pnm1[] = pn[]; pn[] = p[];
+  sigNm3 = sigNm2; sigNm2 = sigNm1;
+  sigNm1 = sigN; sigN = sig;
+  Mnm1 = Mn; Mn = MTF;
+  BauxNm1 = BauxN; BauxN = BauxTF;
+  //Qnm1 = Qn; Qn = Qhat;
+  rhotildeNm3 = rhotildeNm2;
+  rhotildeNm2 = rhotildeNm1;
+  rhotildeNm1 = rhotildeN; rhotildeN = rho;
+   rhoNm3 = rhoNm2; rhoNm2 = rhoNm1; rhoNm1 = rhoN; rhoN = rho;
+   //rhotildeTFNm3 = rhotildeTFNm2;
+   //rhotildeTFNm2 = rhotildeTFNm1; rhotildeTFNm1 = rhotildeTFN; rhotildeTFN =  rhotilde;
+
+   
+    // BE + TF begin with taumin + taumin
+   real dttry = 0.001;
+  real dtprev = dt;
+  real dtnext;real r;
+  real dtprevprev = 0.001;
+  real dtprevprevprev = 0.001;
+
+  // ===== main time loop (BDF2) =====
+  for (int k=1; k<=1000000; ++k){
+	  
+    //dt = dttry;
+    //t += dttry;
+     dt = dttry;
+	t += dt;
+	
+	if (k % 20 == 0){
+      real cpuElapsed = clock()-cpuStart;
+      cout << "k=" << k << " t=" << t
+           << " cpuElapsed=" << cpuElapsed << endl;
+      fCpu << "step\t" << k << "\t" << t << "\t" << dt
+           << "\t" << cpuElapsed << "\t" << "" << "\n";
+      fCpu.flush;
+    }
+	r = dttry/dtprev; 
+    u1star = (1.0+r)*u1n - r*u1nm1; 
+    u2star = (1.0+r)*u2n - r*u2nm1;
+    real alphaStar = (1.0+r)*Mn - r*Mnm1;
+    real betaStar = (1.0+r)*BauxN - r*BauxNm1;
+     // velocity extrapolated to t^n for residual evaluation
+u1RhoAdvN = (1.0+r)*u1nm1 - r*u1nm2;
+u2RhoAdvN = (1.0+r)*u2nm1 - r*u2nm2;
+	
+	
+
+//divUnF = dx(u1starRT) + dy(u2starRT);
+uMagK  = sqrt(u1star*u1star + u2star*u2star) + epsU;
+//tauK   = 1.5 / sqrt( sqr(1.0/dt) + sqr( 2.0*uMagK/hK ) ); 
+//tauK   = 1.5 / sqrt( sqr(1.0/dt) + sqr( 2.0*uMagSym/hSym ) );
+gammaGD = Cgamma * hK * rhoN * (uMagK + 1e-6);
+
+ rvOrder = min(3, k);
+if (rvOrder < 1){ rvOrder = 1;}
+    real tRv = t - dt;
+    
+    ComputeResidualViscosity(
+        Th, S2h,
+        u1n, u2n, pn, rhoN,
+        nu,
+        f21Exact(x,y,tRv),
+        f22Exact(rhoN),
+        u1nm1, u2nm1, rhoNm1,
+        u1nm2, u2nm2, rhoNm2,
+        u1nm3, u2nm3, rhoNm3,
+        dtprev, dtprevprev, dtprevprevprev, Cflat, Cmax, hRV,
+        histInfRhoU, histInfRhoUU, histInfU,
+        Kappa, AlphaFinal,
+         RatioRho, RatioMom, RatioDiv, AlphaRaw,k,rvOrder
+    );
+
+   /* KappaSym = max(
+    Kappa(x,y),
+    Kappa(xmin + xmax - x, y)
+);
+
+Kappa = KappaSym;*/
+
+
+    solve RhotildeSys2(rhotilde, qs, solver=UMFPACK) =
+        int2d(Th, qforder=8)(
+            (1.0/(dt)) * rhotilde * qs
+          - rhotilde * (u1star*dx(qs) + u2star*dy(qs))
+		   //-0.5*rhotilde*( dx(u1starRT)+dy(u2starRT) )*qs
+          /*+ tauK * (u1starRT*dx(qs) + u2starRT*dy(qs)) *
+              ( (1.0/(dt)) * rhotilde
+			  //(3.0/(2.0*dt)) * rhotilde
+              + (u1starRT*dx(rhotilde) + u2starRT*dy(rhotilde))
+              + 0.5*divUnF * rhotilde  )*/
++ Kappa * (
+     dx(rhotilde)*dx(qs) + dy(rhotilde)*dy(qs)
+  )
+        )
+      - int2d(Th, qforder=8)(
+            ((1.0*rhotildeN )/(dt)) * qs
+          /*+ tauK * (u1starRT*dx(qs) + u2starRT*dy(qs)) *
+              ( (1.0*rhotildeN )/(dt)  )*/
+			  //( (4.0*rhotildeN - rhotildeNm1)/(2.0*dt)  )
+        );
+
+	//cout << "nudc max value = " << nudc[].max << " min value = " << nudc[].min << endl;
+	//cout << "gammaGD max value = " << gammaGD[].max << " min value = " << gammaGD[].min << endl;
+
+
+	//time filter for \rhotilde to \rhotildeTF 
+	//rhotildeTF = rhotilde - ( rhotilde - 2.0*rhotildeN + rhotildeNm1 )/3.0;
+    rhotildeTF = rhotilde - ( r/( 1.0+2.0*r ) )*( rhotilde - (1.0+r)*rhotildeN + r*rhotildeNm1 );
+    // projection (BDF2) with discrete mass inner product
+	//cout<< "rhotildeTF min = "<<rhotildeTF[].min << "rhotildeTF max = " << rhotildeTF[].max << endl;
+    {
+       //xi = 0.0;   xiIters = 0; 
+    real F = 0.0, V = 0.0;
+    BezierMassProjectClipP3(
+                  rhotildeTF,
+                  rho,
+                  rho0min,
+                  rho0max,
+                  M0h,
+                  xi,
+                  xiIters,
+                  F
+   );
+   //cout<< " Iterations number = " << xiIters << " , F =  " << F << " , xi = " << xi << endl;
+	 fN << t << "\t" << xiIters << "\t" << F << "\t" << xi << "\n";
+    sig = sqrt(rho);
+    //BezierMassP3(rhotildeTF, MassBefore);
+    //BezierMassP3(rho, MassAfter);
+    /*cout << "Mass before proj = " << MassBefore
+     << ", Mass after proj = " << MassAfter
+     << ", target M0h = " << M0h
+     << ", Mass residual = " << MassAfter - M0h << endl;*/
+    }
+   /*RhoPhysicalMinMax(rho, rhoPhysMin, rhoPhysMax);
+
+  cout << "rho physical min = " << rhoPhysMin
+     << " rho physical max = " << rhoPhysMax
+     << endl; 
+	cout<< "rho min = "<<rho[].min << "rho max = " << rho[].max << endl;*/
+	
+	
+    //muF = muExact(rho);
+  
+    // momentum (BDF2)
+    solve MomSys2([u1hat,u2hat,p],[uu1,uu2,pp]) =
+        int2d(Th,qforder=8)(
+            betaStar*(1.0/(dt))*(sig*sig) * (u1hat*uu1 + u2hat*uu2)
+			+ alphaStar*mu*Grad(u1hat,u2hat)'*Grad(uu1,uu2)
+			//+ Mstar*Kappa*rho*Grad(u1hat,u2hat)'*Grad(uu1,uu2)
+			+  ConvSkew(rho, u1star, u2star, u1hat, u2hat, uu1, uu2)
+          - p*div(uu1,uu2) + pp*div(u1hat,u2hat)
+          + p*pp*epsp
+          + gammaGD * div(u1hat,u2hat) * div(uu1,uu2)
+        )
+  + int2d(Th,qforder=8)(
+        // === f_rho \cdot (\nabla u \cdot v) ===
+        -Kappa * dx(rho) * (uu1 * dx(u1hat) + uu2 * dx(u2hat)) + 
+        -Kappa * dy(rho) * (uu1 * dy(u1hat) + uu2 * dy(u2hat))
+        
+        // === -1/2 f_rho \cdot \nabla(u \cdot v) ===
+        + 0.5 * Kappa * dx(rho) * (dx(u1hat)*uu1 + u1hat*dx(uu1) + dx(u2hat)*uu2 + u2hat*dx(uu2))
+        + 0.5 * Kappa * dy(rho) * (dy(u1hat)*uu1 + u1hat*dy(uu1) + dy(u2hat)*uu2 + u2hat*dy(uu2))
+    )
+	+ int2d(Th,qforder=8)(
+             betaU * Kappa * rho * (
+                  2.0 * dx(u1hat)*dx(uu1) + 2.0 * dy(u2hat)*dy(uu2)
+                + (dy(u1hat) + dx(u2hat)) * (dy(uu1) + dx(uu2))
+              )
+          )
+     + on(1,3, u2hat=0.0)
+     + on(2,4, u1hat=0.0)
+      - int2d(Th,qforder=8)(
+            betaStar*( (sig*(1.0*sigN*u1n )/(dt)) ) * uu1
+          + betaStar*( (sig*(1.0*sigN*u2n )/(dt)) ) * uu2 
+		  //+ Mstar * convoneKrho(Kappa,rho, u1star, u2star, uu1, uu2)
+          + f21Exact(x,y,t)*uu1 + f22Exact(rho)*uu2
+        );
+ 
+
+	// time filter for u and p to uTF and pTF
+	w1 = sig * u1hat; w2 = sig * u2hat;
+	//wTF1 = u1hat - ( r/( 1.0+2.0*r ) )*( u1hat - (1.0+r)*u1n + r*u1nm1 );
+	//wTF2 = u2hat - ( r/( 1.0+2.0*r ) )*( u2hat - (1.0+r)*u2n + r*u2nm1 );
+	wTF1 = w1 - ( r/( 1.0+2.0*r ) )*( w1 - (1.0+r)*sigN*u1n + r*sigNm1*u1nm1 );
+	wTF2 = w2 - ( r/( 1.0+2.0*r ) )*( w2 - (1.0+r)*sigN*u2n + r*sigNm1*u2nm1 );
+	[uTF1,uTF2,pTF] = [wTF1/sig,wTF2/sig,p];
+	//uTF1 = wTF1/sig;
+	//uTF2 = wTF2/sig;
+	
+    //  int (sig * uTF * v) = int (what * v)
+/*varf vProjW(u, v) = int2d(Th)( sig * u * v ) + int2d(Th)( 1e-10 * u * v ); 
+varf vRhsW1(u, v) = int2d(Th)( wTF1 * v );
+varf vRhsW2(u, v) = int2d(Th)( wTF2 * v );
+
+matrix Mproj = vProjW(Vh, Vh, solver=CG); 
+real[int] rhs1 = vRhsW1(0, Vh);
+real[int] rhs2 = vRhsW2(0, Vh);
+
+uTF1[] = Mproj^-1 * rhs1;
+uTF2[] = Mproj^-1 * rhs2;*/
+	
+	//uTF1 = u1 - ( u1 - 2.0*u1n + u1nm1 )/3.0;
+	//uTF2 = u2 - ( u2 - 2.0*u2n + u2nm1 )/3.0;
+	//pTF = p - ( p - 2.0*pn + pnm1 )/3.0;
+	//pTF = p;
+
+		
+    // M update (BDF2)
+ real BM0 = int2d(Th, qforder=10)(
+               2.0 * mu * (
+            e11(uTF1, uTF2) * e11(uTF1, uTF2) +  
+            e22(uTF1, uTF2) * e22(uTF1, uTF2) +  
+            2.0 * e12(uTF1, uTF2) * e12(uTF1, uTF2) 
+               )
+             )
+			 /*+ int1d(Th, 1,2,3,4)( 
+          - 2.0 * mu * (
+            (e11(uTF1, uTF2) * N.x + e12(uTF1, uTF2) * N.y) * uTF1 
+            +
+            (e12(uTF1, uTF2) * N.x + e22(uTF1, uTF2) * N.y) * uTF2
+          )
+		  )*/;
+  real BM1 = int2d(Th, qforder=10)(
+               -mu*Grad(u1hat,u2hat)'*Grad(u1hat,u2hat)
+               //+ convone(muF, u1star, u2star, u1hat,u2hat)
+             )
+			 /*+int1d(Th, 1,2,3,4)(
+               mu * ( ( dx(u1hat)*N.x + dy(u1hat)*N.y )*u1hat + ( dx(u2hat)*N.x + dy(u2hat)*N.y )*u2hat )
+             )*/;
+  //M = ( 4*Mn - Mnm1 + 2*dt * alpha * ( BM0 - Mstar * BM1) )/3.0;
+   Mhat = Mn + dt*Qcsav*(-1*BM0-alphaStar*BM1);
+   
+   // time fliter for M to MTF
+   //MTF = Mhat - ( Mhat - 2.0*Mn + Mnm1 )/3.0;
+   MTF = Mhat - ( r/( 1.0+2.0*r ) )*( Mhat - (1.0+r)*Mn + r*Mnm1 );
+
+   // beta D2 update: retain the variable-step D2 energy structure.
+   real d20 = (1.0+2.0*r)/(1.0+r);
+   real d21 = r/(1.0+r);
+   D2w1 = d20*(sig*uTF1-sigN*u1n)/dt
+         -d21*(sigN*u1n-sigNm1*u1nm1)/dtprev;
+   D2w2 = d20*(sig*uTF2-sigN*u2n)/dt
+         -d21*(sigN*u2n-sigNm1*u2nm1)/dtprev;
+   real normWN = int2d(Th, qforder=qOrd)(sqr(sigN*u1n)+sqr(sigN*u2n));
+   real normWNm1 = int2d(Th, qforder=qOrd)(sqr(sigNm1*u1nm1)+sqr(sigNm1*u2nm1));
+   real D2NormW = d20*(int2d(Th, qforder=qOrd)(sqr(sig*uTF1)+sqr(sig*uTF2))-normWN)/dt
+                 -d21*(normWN-normWNm1)/dtprev;
+   real D2wWHat = int2d(Th, qforder=qOrd)(D2w1*w1+D2w2*w2);
+   BauxHat = BauxN+Zbeta*dt*(-0.5*D2NormW+betaStar*D2wWHat);
+   BauxTF = BauxHat-(r/(1.0+2.0*r))
+             *(BauxHat-(1.0+r)*BauxN+r*BauxNm1);
+
+  // Compute the current theorem energy before the adaptive controller.
+  // These values are reused by the energy diagnostics below; TEg is committed once.
+  gravityPowerCurr = int2d(Th, qforder=qOrdDiag)(
+      f22Exact(rho)*u2hat);
+  real EgCurrent = dt*gravityPowerCurr;
+  real TEgCurrent = TEg
+                   + 0.5*dt*(gravityPowerPrev + gravityPowerCurr);
+  real Em1Current = 0.5*int2d(Th, qforder=qOrd)(
+      sqr(sig*uTF1)+sqr(sig*uTF2));
+  real Em2Current = MTF/Qcsav;
+  real Em3Current = (BauxTF-1.0)/Zbeta;
+  real EmCurrent = Em1Current+Em2Current+Em3Current;
+  real EnCurrent = EmCurrent-TEgCurrent;
+  real dEnDt = (EnCurrent-EnPrev)/dt;
+  real Cadv = dEnDt*dEnDt;
+	
+  // dtvar-only adaptive controller; no accuracy estimator is evaluated.
+  real tauVarRaw = dtmax/sqrt(1.0+kappaAda*Cadv);
+  real tauVar = max(dtmin,tauVarRaw);
+  real CadvCrit = ((dtmax/dtmin)*(dtmax/dtmin)-1.0)/kappaAda;
+  dtnext = min(dtmax,
+           min(2.0*dt,
+             max(dtmin,
+               max(0.5*dt,tauVar))));
+
+  string finalLimiter = "tauVar";
+  if ((abs(dtnext-dtmin) < 1.0e-14) && (tauVar < dtmin))
+      finalLimiter = "dtmin";
+  else if ((abs(dtnext-0.5*dt) < 1.0e-14) && (tauVar < 0.5*dt))
+      finalLimiter = "ratioHalf";
+  else if ((abs(dtnext-dtmax) < 1.0e-14) && (tauVar > dtmax))
+      finalLimiter = "dtmax";
+  else if ((abs(dtnext-2.0*dt) < 1.0e-14) && (tauVar > 2.0*dt))
+      finalLimiter = "ratioDouble";
+
+  if (t+dtnext > Tend) {
+      dtnext = Tend-t;
+      finalLimiter = "finalTime";
+  }
+
+  real dtNextOverDtMin = dtnext/dtmin;
+  real tauVarRawOverDtMin = tauVarRaw/dtmin;
+  real ratioNext = dtnext/dt;
+  cout << "[adaptive-dtvar] Cadv=" << Cadv
+       << " CadvCrit=" << CadvCrit
+       << " tauVarRaw=" << tauVarRaw
+       << " tauVar=" << tauVar
+       << " dtNext=" << dtnext << endl;
+
+  fAda << k << "\t" << t << "\t" << dt << "\t" << r
+       << "\t" << EnCurrent << "\t" << EnPrev << "\t" << dEnDt
+       << "\t" << Cadv << "\t" << CadvCrit
+       << "\t" << tauVarRaw << "\t" << tauVar
+       << "\t" << dtnext
+       << "\t" << dtNextOverDtMin << "\t" << tauVarRawOverDtMin
+       << "\t" << ratioNext
+       << "\t" << finalLimiter << "\n";
+  fAda.flush;
+
+  fdt << t << "\t" << dttry << "\t" << dtnext
+       << "\t" << tauVarRaw << "\t" << tauVar
+       << "\t" << Cadv << "\t" << CadvCrit
+       << "\t" << finalLimiter << endl;
+
+    fdt.flush;
+
+
+	  // ===== energy diagnostics at k >=2 =====
+  kIdx = k+1;
+ 
+   EkInit = 0.5* int2d(Th, qforder=qOrdDiag)( (sig*sig)*(uTF1*uTF1 + uTF2*uTF2) ); 
+  //real WorkInit = int2d(Th, qforder=qOrd)( f21Exact(x,y,t) * u1n + f22Exact(x,y,t) * u2n  );
+  Ehat = 0.5*EkInit 
+           + 0.25*int2d(Th, qforder=qOrdDiag)( sqr(2*sig*uTF1 - sigN*u1n) + sqr(2*sig*uTF2 - sigN*u2n) )
+  		   +1.0/(2.0*Qcsav)*( (3*MTF-Mn) ) + 0.25 * int2d(Th, qforder=qOrd)( 
+                 sqr(sig*uTF1 - sigN*u1n) + 
+                 sqr(sig*uTF2 - sigN*u2n) 
+             ); 
+  ErefInit = EkInit ;
+  Mnms = 1.0/(2.0*Qcsav)*( (3*MTF-Mn) );
+  Ehatu = 0.5*EkInit 
+           + 0.25*int2d(Th, qforder=qOrdDiag)( sqr(2*sig*uTF1 - sigN*u1n) + sqr(2*sig*uTF2 - sigN*u2n) )
+		   + 0.25 * int2d(Th, qforder=qOrdDiag)( 
+                 sqr(sig*uTF1 - sigN*u1n) + 
+                 sqr(sig*uTF2 - sigN*u2n) 
+             ); 
+  //real EmodInit = EkInit + 1/alpha*1.0 - 1/alpha*1.0;
+  //ErefPrev = EmodInit;
+  Eg = EgCurrent;
+  TEg = TEgCurrent;
+  gravityPowerPrev = gravityPowerCurr;
+
+  //Massh0 = int2d(Th, qforder=qOrd)(rho);
+   BezierMassP3(rho, Massh0);
+  mResh0 = Massh0 - M0h;
+  //rhoMinInit = rho[].min;
+  //rhoMaxInit = rho[].max;
+  RhoPhysicalMinMax(rho, rhoPhysMin, rhoPhysMax);
+  Diss = -2.0*int2d(Th, qforder=qOrdDiag)(
+               (mu)*( sqr(dx(uTF1)) + sqr(dy(uTF2))
+			    + 2.0*sqr( 0.5*(dx(uTF2)+dy(uTF1)) ) ) );
+  DE = ( Ehat - Ehatn - dt*Diss - Eg );
+
+  // New theorem modified energy: physical weighted kinetic energy + alpha/Q + (beta-1)/Z.
+  Em1 = Em1Current;
+  Em2 = Em2Current;
+  Em3 = Em3Current;
+  Em = EmCurrent;
+
+
+  fTS << kIdx << "\t" << t
+      << "\t" << Massh0
+	   << "\t" << mResh0
+	   << "\t" << MTF-1.0
+	   << "\t" << rhoPhysMin
+	   << "\t" << rhoPhysMax
+      << "\t" << Ehat
+	   << "\t" << ErefInit
+	   << "\t" << Eg
+      << "\t" << Diss << "\t" << DE << "\t" << MTF/Qcsav 
+  	  << "\t" << TEg << "\t" << Mnms << "\t" << Ehatu
+      << "\t" << MTF << "\t" << BauxTF
+      << "\t" << Em1 << "\t" << Em2 << "\t" << Em3 << "\t" << Em << "\n";
+
+  EnPrev = EnCurrent;
+
+  // roll histories
+    Ehatn = Ehat;
+
+   // history update
+	dtprevprevprev = dtprevprev;
+	dtprevprev = dtprev;
+	  dtprev  = dt;
+    dttry      = dtnext;
+
+	//u1nm2 = u1nm1; u2nm2 = u2nm1;
+    [u1nm3, u2nm3, pnm3] = [u1nm2, u2nm2, pnm2];
+  [u1nm2, u2nm2, pnm2] = [u1nm1, u2nm1, pnm1];
+	[u1nm1, u2nm1, pnm1] = [u1n, u2n, pn];
+    [u1n, u2n, pn]       = [uTF1, uTF2, pTF];
+
+    sigNm3 = sigNm2; sigNm2 = sigNm1;
+    sigNm1 = sigN; sigN = sig;
+    //u1nm1 = u1n; u2nm1 = u2n;
+    //u1n = uTF1; u2n = uTF2;
+    //pnm1[] = pn[]; pn[] = pTF[];
+    Mnm1 = Mn; Mn = MTF;
+	BauxNm1 = BauxN; BauxN = BauxTF;
+	//Qnm1 = Qn; Qn = QTF;
+    rhotildeNm3 = rhotildeNm2;
+    rhotildeNm2 = rhotildeNm1; 
+    rhotildeNm1 = rhotildeN; rhotildeN = rho;
+    rhoNm3 = rhoNm2;
+	rhoNm2 = rhoNm1; rhoNm1 = rhoN; rhoN = rho;
+    //rhotildeTFNm1 = rhotildeTFN; rhotildeTFN =  rhotildeTF;
+	
+	 //cout << "  -> step ACCEPTED, new dt = " << dtnext << endl;
+
+ S2h uMagNow;
+  S2h cflNowField;
+uMagNow = sqrt(u1n*u1n + u2n*u2n);
+cflNowField = dt*uMagNow/(hK + 1.0e-16);
+
+if (k % 500 == 0) {
+    cout << "[CFL-monitor] k=" << k
+         << " t=" << t
+         << " CFLmax=" << cflNowField[].max
+         << " umax=" << uMagNow[].max
+         << " hKmin=" << hK[].min
+         << endl;
+    fC << "[CFL-monitor] k=" << k
+         << " t=" << t
+         << " CFLmax=" << cflNowField[].max
+         << " umax=" << uMagNow[].max
+         << " hKmin=" << hK[].min
+         << endl;   
+        fC.flush; 
+}
+
+
+   
+if((
+        abs(t-0.05) < 0.5*dt
+    ||  abs(t-0.1) < 0.5*dt
+    || abs(t-0.5) < 0.5*dt
+    || abs(t-1.0) < 0.5*dt
+    || abs(t-1.1) < 0.5*dt
+    || abs(t-1.2) < 0.5*dt
+    || abs(t-1.3) < 0.5*dt
+    || abs(t-2.1) < 0.5*dt
+    || abs(t-2.2) < 0.5*dt
+    || abs(t-2.5) < 0.5*dt
+    || abs(t-3.0) < 0.5*dt
+    || abs(t-0.8) < 0.5*dt 	 )){
+		 cout << " k=" << k
+           << " t=" << t
+          //<< " CFL=" << cfl << " (umax=" << umax << ")\n"
+           << endl;
+		   //ffSaveData(u1,"utest_t"+t+".txt");
+           //ffSaveData(u2,"vtest_t"+t+".txt");
+		   
+		   ffSaveData(rho,"rhotestz_t"+t+".txt");
+        ffSaveData(Kappa,"Kappatestz_t"+t+".txt");
+        ffSaveData(AlphaFinal,"AlphaFinal_t"+t+".txt");     
+                 cout << "Savedt= " << t << endl;
+	 }
+
+    /*if ( (k-1) % nSave == 0){
+      cout << " k=" << k
+           << " t=" << t
+           << " CFL=" << cfl << " (umax=" << umax << ")\n"
+           << endl;
+		   //ffSaveData(u1,"utest_t"+t+".txt");
+           //ffSaveData(u2,"vtest_t"+t+".txt");
+		   ffSaveVh(Th,S2h,"fespace_S2h"+t+".txt");
+		   savemesh(Th, "NS_BP_TF_PnonTF"+t+".msh");
+		   ffSaveData(rho,"rhotestz_t"+t+".txt");
+		   ffSaveData(Kappa,"Kappatestz_t"+t+".txt");
+        ffSaveData(AlphaFinal,"AlphaFinal_t"+t+".txt");
+        ffSaveData(RatioRho, "RatioRho_t"+t+".txt");
+        ffSaveData(RatioMom, "RatioMom_t"+t+".txt");
+        ffSaveData(RatioDiv, "RatioDiv_t"+t+".txt");
+           cout << "Savedt= " << t << endl;
+		   //plot(rho, cmm="rho",fill=true, value=true,wait=false,ps="rhoz_t"+t+".eps");
+		
+    }*/
+    
+     if (abs(t - Tend) < 1e-10){
+      ffSaveData(rho,"rhotest_t"+t+".txt");
+      cout << "Saved final exactly at t= " << t << endl;
+      break;
+    }
+
+   } // time loop
+
+  real totalCpuTime = clock()-cpuStart;
+  fCpu << "total\t-1\t" << t << "\t" << dt
+       << "\t" << totalCpuTime << "\t" << totalCpuTime << "\n";
+  fCpu.flush;
+  cout << "[cpu] totalCpuTime=" << totalCpuTime << " seconds" << endl;
