@@ -1,0 +1,717 @@
+// =======================================================
+// BezierP3Limiter.idp
+// Continuous P3 Bernstein/Bezier limiter for FreeFEM
+//
+// Assumptions:
+//   mesh    : Th
+//   fespace : S2h(Th, P3, ...)
+//
+// Your FreeFEM P3 local order detected by checkP3order:
+//      0,1,2 : vertices
+//      3     : edge 1-2 midpoint
+//      4     : edge 2-0 midpoint
+//      5     : edge 0-1 midpoint
+//
+// Internal Bezier local order used in this file:
+//      0 : b200, vertex 0
+//      1 : b020, vertex 1
+//      2 : b002, vertex 2
+//      3 : b110, edge 0-1
+//      4 : b011, edge 1-2
+//      5 : b101, edge 2-0
+// =======================================================
+
+
+// ---------- global Bezier data ----------
+int nBezierDof = S2h.ndof;
+
+// P3 local Bezier order used here:
+//   0 : b300, vertex 0
+//   1 : b030, vertex 1
+//   2 : b003, vertex 2
+//   3 : b210, edge 0-1, closer to vertex 0
+//   4 : b120, edge 0-1, closer to vertex 1
+//   5 : b021, edge 1-2, closer to vertex 1
+//   6 : b012, edge 1-2, closer to vertex 2
+//   7 : b102, edge 2-0, closer to vertex 2
+//   8 : b201, edge 2-0, closer to vertex 0
+//   9 : b111, cell interior
+int[int] BezierDofKP3(10*Th.nt);
+
+// positive Bernstein mass weights
+real[int] Wb(nBezierDof);
+
+// work arrays
+//int[int] BezierCnt(nBezierDof);
+
+
+// ---------- triangle area ----------
+macro TriArea(k) (
+    0.5*abs(
+        (Th[k][1].x - Th[k][0].x)*(Th[k][2].y - Th[k][0].y)
+      - (Th[k][2].x - Th[k][0].x)*(Th[k][1].y - Th[k][0].y)
+    )
+) //
+
+
+
+// =======================================================
+// 1. BuildBezierWeightsP3
+// =======================================================
+//
+// On each triangle K,
+//     integral_K B_alpha dx = |K| / 10
+// for all six P3 Bernstein basis functions.
+//
+// Therefore the global positive mass weight is obtained by
+// adding |K|/10 to every local Bezier dof.
+// =======================================================
+
+macro BuildBezierWeightsP3(BezierDofKP3, Wb) {
+    Wb = 0.0;
+
+    for (int kEl = 0; kEl < Th.nt; ++kEl) {
+        real areaK = TriArea(kEl);
+        real wK = areaK / 10.0;
+
+        for (int j = 0; j < 10; ++j) {
+            int gj = BezierDofKP3[10*kEl + j];
+            Wb[gj] += wK;
+        }
+    }
+} //
+
+
+// =======================================================
+// 2. LagrangeP3ToBezier(u,b)
+// =======================================================
+//
+// On one triangle:
+//
+// Lagrange P2 values:
+//   u0, u1, u2      : vertices
+//   u01, u12, u20   : edge midpoints
+//
+// Bernstein coefficients:
+// =======================================================
+macro LagrangeP3ToBezier(u, b, BezierDofKP3) {
+    b = 0.0;
+
+    int[int] BezierCntP3(nBezierDof);
+    BezierCntP3 = 0;
+
+    for (int kEl = 0; kEl < Th.nt; ++kEl) {
+        int g300 = BezierDofKP3[10*kEl + 0];
+        int g030 = BezierDofKP3[10*kEl + 1];
+        int g003 = BezierDofKP3[10*kEl + 2];
+
+        int g210 = BezierDofKP3[10*kEl + 3];
+        int g120 = BezierDofKP3[10*kEl + 4];
+
+        int g021 = BezierDofKP3[10*kEl + 5];
+        int g012 = BezierDofKP3[10*kEl + 6];
+
+        int g102 = BezierDofKP3[10*kEl + 7];
+        int g201 = BezierDofKP3[10*kEl + 8];
+
+        int g111 = BezierDofKP3[10*kEl + 9];
+
+        real u300 = u[][g300];
+        real u030 = u[][g030];
+        real u003 = u[][g003];
+
+        real u210 = u[][g210];
+        real u120 = u[][g120];
+
+        real u021 = u[][g021];
+        real u012 = u[][g012];
+
+        real u102 = u[][g102];
+        real u201 = u[][g201];
+
+        real u111 = u[][g111];
+
+        real b300 = u300;
+        real b030 = u030;
+        real b003 = u003;
+
+        real b210 =  3.0*u210 - 1.5*u120 - (5.0/6.0)*u300 + (1.0/3.0)*u030;
+        real b120 = -1.5*u210 + 3.0*u120 + (1.0/3.0)*u300 - (5.0/6.0)*u030;
+
+        real b021 =  3.0*u021 - 1.5*u012 - (5.0/6.0)*u030 + (1.0/3.0)*u003;
+        real b012 = -1.5*u021 + 3.0*u012 + (1.0/3.0)*u030 - (5.0/6.0)*u003;
+
+        real b102 =  3.0*u102 - 1.5*u201 - (5.0/6.0)*u003 + (1.0/3.0)*u300;
+        real b201 = -1.5*u102 + 3.0*u201 + (1.0/3.0)*u003 - (5.0/6.0)*u300;
+
+        real b111 = (
+              27.0*u111
+            - (b300 + b030 + b003)
+            - 3.0*(b210 + b120 + b021 + b012 + b102 + b201)
+        ) / 6.0;
+
+        b[g300] += b300;
+        b[g030] += b030;
+        b[g003] += b003;
+
+        b[g210] += b210;
+        b[g120] += b120;
+
+        b[g021] += b021;
+        b[g012] += b012;
+
+        b[g102] += b102;
+        b[g201] += b201;
+
+        b[g111] += b111;
+
+        BezierCntP3[g300] += 1;
+        BezierCntP3[g030] += 1;
+        BezierCntP3[g003] += 1;
+        BezierCntP3[g210] += 1;
+        BezierCntP3[g120] += 1;
+        BezierCntP3[g021] += 1;
+        BezierCntP3[g012] += 1;
+        BezierCntP3[g102] += 1;
+        BezierCntP3[g201] += 1;
+        BezierCntP3[g111] += 1;
+    }
+
+    for (int i = 0; i < nBezierDof; ++i) {
+        if (BezierCntP3[i] > 0) {
+            b[i] /= BezierCntP3[i];
+        }
+    }
+} //
+
+
+// =======================================================
+// 4. BezierToLagrangeP3(b,u)
+// =======================================================
+// =======================================================
+
+macro BezierToLagrangeP3(b, u, BezierDofKP3) {
+    u[] = 0.0;
+
+    int[int] BezierCntP3(u[].n);
+    BezierCntP3 = 0;
+
+    for (int kEl = 0; kEl < Th.nt; ++kEl) {
+        int g300 = BezierDofKP3[10*kEl + 0];
+        int g030 = BezierDofKP3[10*kEl + 1];
+        int g003 = BezierDofKP3[10*kEl + 2];
+
+        int g210 = BezierDofKP3[10*kEl + 3];
+        int g120 = BezierDofKP3[10*kEl + 4];
+
+        int g021 = BezierDofKP3[10*kEl + 5];
+        int g012 = BezierDofKP3[10*kEl + 6];
+
+        int g102 = BezierDofKP3[10*kEl + 7];
+        int g201 = BezierDofKP3[10*kEl + 8];
+
+        int g111 = BezierDofKP3[10*kEl + 9];
+
+        real b300 = b[g300];
+        real b030 = b[g030];
+        real b003 = b[g003];
+
+        real b210 = b[g210];
+        real b120 = b[g120];
+
+        real b021 = b[g021];
+        real b012 = b[g012];
+
+        real b102 = b[g102];
+        real b201 = b[g201];
+
+        real b111 = b[g111];
+
+        u[][g300] += b300;
+        u[][g030] += b030;
+        u[][g003] += b003;
+
+        u[][g210] += (8.0*b300 + 12.0*b210 + 6.0*b120 + b030)/27.0;
+        u[][g120] += (b300 + 6.0*b210 + 12.0*b120 + 8.0*b030)/27.0;
+
+        u[][g021] += (8.0*b030 + 12.0*b021 + 6.0*b012 + b003)/27.0;
+        u[][g012] += (b030 + 6.0*b021 + 12.0*b012 + 8.0*b003)/27.0;
+
+        u[][g102] += (b300 + 6.0*b201 + 12.0*b102 + 8.0*b003)/27.0;
+        u[][g201] += (8.0*b300 + 12.0*b201 + 6.0*b102 + b003)/27.0;
+
+        u[][g111] += (
+              b300 + b030 + b003
+            + 3.0*(b210 + b120 + b021 + b012 + b102 + b201)
+            + 6.0*b111
+        )/27.0;
+
+        BezierCntP3[g300] += 1;
+        BezierCntP3[g030] += 1;
+        BezierCntP3[g003] += 1;
+        BezierCntP3[g210] += 1;
+        BezierCntP3[g120] += 1;
+        BezierCntP3[g021] += 1;
+        BezierCntP3[g012] += 1;
+        BezierCntP3[g102] += 1;
+        BezierCntP3[g201] += 1;
+        BezierCntP3[g111] += 1;
+    }
+
+    for (int i = 0; i < u[].n; ++i) {
+        if (BezierCntP3[i] > 0) {
+            u[][i] /= BezierCntP3[i];
+        }
+    }
+} //
+
+// BuildBezierDofKP3
+// Build local-to-global map for P3 Bezier coefficients.
+
+macro BuildBezierDofKP3(Th, Xh, BezierDofKP3) {
+    Xh Xdof = x;
+    Xh Ydof = y;
+
+    BezierDofKP3.resize(10*Th.nt);
+
+    for (int kEl = 0; kEl < Th.nt; ++kEl) {
+
+        real x0 = Th[kEl][0].x;
+        real y0 = Th[kEl][0].y;
+        real x1 = Th[kEl][1].x;
+        real y1 = Th[kEl][1].y;
+        real x2 = Th[kEl][2].x;
+        real y2 = Th[kEl][2].y;
+
+        real[int] tx(10), ty(10);
+
+       
+        tx[0] = x0;
+        ty[0] = y0;
+
+       
+        tx[1] = x1;
+        ty[1] = y1;
+
+       
+        tx[2] = x2;
+        ty[2] = y2;
+
+       
+        tx[3] = (2.0*x0 + x1)/3.0;
+        ty[3] = (2.0*y0 + y1)/3.0;
+
+       
+        tx[4] = (x0 + 2.0*x1)/3.0;
+        ty[4] = (y0 + 2.0*y1)/3.0;
+
+       
+        tx[5] = (2.0*x1 + x2)/3.0;
+        ty[5] = (2.0*y1 + y2)/3.0;
+
+        tx[6] = (x1 + 2.0*x2)/3.0;
+        ty[6] = (y1 + 2.0*y2)/3.0;
+
+        tx[7] = (2.0*x2 + x0)/3.0;
+        ty[7] = (2.0*y2 + y0)/3.0;
+
+        tx[8] = (x2 + 2.0*x0)/3.0;
+        ty[8] = (y2 + 2.0*y0)/3.0;
+
+        tx[9] = (x0 + x1 + x2)/3.0;
+        ty[9] = (y0 + y1 + y2)/3.0;
+
+        for (int j = 0; j < 10; ++j) {
+            real best = 1.0e100;
+            int bestG = -1;
+
+            for (int iloc = 0; iloc < 10; ++iloc) {
+                int gi = Xh(kEl, iloc);
+                real d2 = square(Xdof[][gi] - tx[j])
+                        + square(Ydof[][gi] - ty[j]);
+
+                if (d2 < best) {
+                    best = d2;
+                    bestG = gi;
+                }
+            }
+
+            if (best > 1.0e-20) {
+                cout << "[BuildBezierDofKP3 warning] kEl=" << kEl
+                     << " j=" << j
+                     << " best=" << best << endl;
+            }
+
+            BezierDofKP3[10*kEl + j] = bestG;
+        }
+    }
+} // EOM
+
+
+// =======================================================
+// BezierMassFromCoeffP3(b,mass)
+// =======================================================
+//
+// mass = sum_j Wb[j] * b[j]
+// =======================================================
+
+macro BezierMassFromCoeffP3(b, mass) {
+    mass = 0.0;
+    for (int j = 0; j < nBezierDof; ++j) {
+        mass += Wb[j] * b[j];
+    }
+} //
+
+
+
+// =======================================================
+// BezierMassP3(u,mass)
+// =======================================================
+// =======================================================
+
+macro BezierMassP3(u, mass) {
+    real[int] bp3btmp(nBezierDof);
+    LagrangeP3ToBezier(u, bp3btmp, BezierDofKP3);
+    BezierMassFromCoeffP3(bp3btmp, mass);
+} //
+
+// =======================================================
+// BezierClipP3
+// =======================================================
+macro BezierClipP3(u, lower, upper) {
+    real[int] bp3bclip(nBezierDof);
+
+    LagrangeP3ToBezier(u, bp3bclip, BezierDofKP3);
+
+    for (int j = 0; j < nBezierDof; ++j) {
+        bp3bclip[j] = min(upper, max(lower, bp3bclip[j]));
+    }
+
+    BezierToLagrangeP3(bp3bclip, u, BezierDofKP3);
+} //
+
+
+
+
+
+// =======================================================
+// 5. BezierMassProjectClipP3
+// =======================================================
+//
+// Given uHat, find xi such that
+//
+//   bNew_j = clip(bHat_j - xi, lower, upper)
+//
+// satisfies
+//
+//   sum_j Wb[j] bNew_j = targetMass.
+//
+// This is the Bernstein version of your original Lagrange
+// multiplier Newton projection.
+// =======================================================
+
+macro BezierMassProjectClipP3(uHat, uNew, lower, upper, targetMass, xiOut, itOut, Fout) {
+    real[int] bp3bhat(nBezierDof);
+    real[int] bp3bnew(nBezierDof);
+
+    LagrangeP3ToBezier(uHat, bp3bhat, BezierDofKP3);
+
+    real bp3xiL =  1.0e100;
+    real bp3xiR = -1.0e100;
+
+    for (int j = 0; j < nBezierDof; ++j) {
+        bp3xiL = min(bp3xiL, bp3bhat[j] - upper);
+        bp3xiR = max(bp3xiR, bp3bhat[j] - lower);
+    }
+
+    bp3xiL -= 1.0;
+    bp3xiR += 1.0;
+
+    real bp3xi = 0.0;
+    if (bp3xi <= bp3xiL || bp3xi >= bp3xiR) {
+        bp3xi = 0.5*(bp3xiL + bp3xiR);
+    }
+
+    real bp3F = 0.0;
+    real bp3V = 0.0;
+    int  bp3itFinal = 0;
+
+    for (int it = 0; it < Itenum; ++it) {
+        bp3F = 0.0;
+        bp3V = 0.0;
+
+        for (int j = 0; j < nBezierDof; ++j) {
+            real a = bp3bhat[j] - bp3xi;
+
+            if ((lower < a) && (a < upper)) {
+                bp3F += Wb[j] * a;
+                bp3V -= Wb[j];
+            }
+            else if (a <= lower) {
+                bp3F += Wb[j] * lower;
+            }
+            else {
+                bp3F += Wb[j] * upper;
+            }
+        }
+
+        bp3F -= targetMass;
+
+        if (abs(bp3F) <= tol) {
+            bp3itFinal = it;
+            break;
+        }
+
+        if (bp3F > 0.0) {
+            bp3xiL = bp3xi;
+        }
+        else {
+            bp3xiR = bp3xi;
+        }
+
+        real bp3xiNew = bp3xi;
+
+        if (abs(bp3V) > 1.0e-30) {
+            bp3xiNew = bp3xi - bp3F / bp3V;
+        }
+        else {
+            bp3xiNew = 0.5*(bp3xiL + bp3xiR);
+        }
+
+        if ((bp3xiNew <= bp3xiL) || (bp3xiNew >= bp3xiR)) {
+            bp3xiNew = 0.5*(bp3xiL + bp3xiR);
+        }
+
+        bp3xi = bp3xiNew;
+        bp3itFinal = it + 1;
+    }
+
+    for (int j = 0; j < nBezierDof; ++j) {
+        bp3bnew[j] = min(upper, max(lower, bp3bhat[j] - bp3xi));
+    }
+
+    BezierToLagrangeP3(bp3bnew, uNew, BezierDofKP3);
+
+    bp3F = 0.0;
+    for (int j = 0; j < nBezierDof; ++j) {
+        bp3F += Wb[j] * bp3bnew[j];
+    }
+    bp3F -= targetMass;
+
+    xiOut = bp3xi;
+    itOut = bp3itFinal;
+    Fout = bp3F;
+} //
+
+
+// =======================================================
+// LagrangeDualToBezierDual(rhsL, rhsB)
+// =======================================================
+//
+// Convert a Lagrange P2 dual vector
+//
+//      rhsL_i = int f * phi_i
+//
+// into a Bernstein/Bezier dual vector
+//
+//      rhsB_i = int f * B_i
+//
+// This is the transpose map corresponding to
+// BezierToLagrangeP3.
+//
+// Requires:
+//   BezierDofKP3
+//   nBezierDof
+// =======================================================
+macro LagrangeDualToBezierDualP3(rhsL, rhsB) {
+    rhsB = 0.0;
+
+    int[int] bp3seen(nBezierDof);
+    bp3seen = 0;
+
+    for (int kEl = 0; kEl < Th.nt; ++kEl) {
+
+        int g300 = BezierDofKP3[10*kEl + 0];
+        int g030 = BezierDofKP3[10*kEl + 1];
+        int g003 = BezierDofKP3[10*kEl + 2];
+
+        int g210 = BezierDofKP3[10*kEl + 3];
+        int g120 = BezierDofKP3[10*kEl + 4];
+
+        int g021 = BezierDofKP3[10*kEl + 5];
+        int g012 = BezierDofKP3[10*kEl + 6];
+
+        int g102 = BezierDofKP3[10*kEl + 7];
+        int g201 = BezierDofKP3[10*kEl + 8];
+
+        int g111 = BezierDofKP3[10*kEl + 9];
+
+        
+        if (!bp3seen[g300]) {
+            rhsB[g300] += rhsL[g300];
+            bp3seen[g300] = 1;
+        }
+
+        
+        if (!bp3seen[g030]) {
+            rhsB[g030] += rhsL[g030];
+            bp3seen[g030] = 1;
+        }
+
+        
+        if (!bp3seen[g003]) {
+            rhsB[g003] += rhsL[g003];
+            bp3seen[g003] = 1;
+        }
+
+        
+        if (!bp3seen[g210]) {
+            rhsB[g300] += (8.0/27.0)  * rhsL[g210];
+            rhsB[g210] += (12.0/27.0) * rhsL[g210];
+            rhsB[g120] += (6.0/27.0)  * rhsL[g210];
+            rhsB[g030] += (1.0/27.0)  * rhsL[g210];
+            bp3seen[g210] = 1;
+        }
+
+        
+        if (!bp3seen[g120]) {
+            rhsB[g300] += (1.0/27.0)  * rhsL[g120];
+            rhsB[g210] += (6.0/27.0)  * rhsL[g120];
+            rhsB[g120] += (12.0/27.0) * rhsL[g120];
+            rhsB[g030] += (8.0/27.0)  * rhsL[g120];
+            bp3seen[g120] = 1;
+        }
+
+        
+        if (!bp3seen[g021]) {
+            rhsB[g030] += (8.0/27.0)  * rhsL[g021];
+            rhsB[g021] += (12.0/27.0) * rhsL[g021];
+            rhsB[g012] += (6.0/27.0)  * rhsL[g021];
+            rhsB[g003] += (1.0/27.0)  * rhsL[g021];
+            bp3seen[g021] = 1;
+        }
+
+        
+        if (!bp3seen[g012]) {
+            rhsB[g030] += (1.0/27.0)  * rhsL[g012];
+            rhsB[g021] += (6.0/27.0)  * rhsL[g012];
+            rhsB[g012] += (12.0/27.0) * rhsL[g012];
+            rhsB[g003] += (8.0/27.0)  * rhsL[g012];
+            bp3seen[g012] = 1;
+        }
+
+        
+        if (!bp3seen[g102]) {
+            rhsB[g300] += (1.0/27.0)  * rhsL[g102];
+            rhsB[g201] += (6.0/27.0)  * rhsL[g102];
+            rhsB[g102] += (12.0/27.0) * rhsL[g102];
+            rhsB[g003] += (8.0/27.0)  * rhsL[g102];
+            bp3seen[g102] = 1;
+        }
+
+        
+        if (!bp3seen[g201]) {
+            rhsB[g300] += (8.0/27.0)  * rhsL[g201];
+            rhsB[g201] += (12.0/27.0) * rhsL[g201];
+            rhsB[g102] += (6.0/27.0)  * rhsL[g201];
+            rhsB[g003] += (1.0/27.0)  * rhsL[g201];
+            bp3seen[g201] = 1;
+        }
+
+        
+        if (!bp3seen[g111]) {
+            rhsB[g300] += (1.0/27.0) * rhsL[g111];
+            rhsB[g030] += (1.0/27.0) * rhsL[g111];
+            rhsB[g003] += (1.0/27.0) * rhsL[g111];
+
+            rhsB[g210] += (3.0/27.0) * rhsL[g111];
+            rhsB[g120] += (3.0/27.0) * rhsL[g111];
+
+            rhsB[g021] += (3.0/27.0) * rhsL[g111];
+            rhsB[g012] += (3.0/27.0) * rhsL[g111];
+
+            rhsB[g102] += (3.0/27.0) * rhsL[g111];
+            rhsB[g201] += (3.0/27.0) * rhsL[g111];
+
+            rhsB[g111] += (6.0/27.0) * rhsL[g111];
+
+            bp3seen[g111] = 1;
+        }
+    }
+} //
+
+// =======================================================
+// BezierLumpedRecoverP3(rhsL, uh)
+// =======================================================
+//
+// Given a Lagrange P3 RHS vector rhsL:
+//
+//      rhsL_i = int f * phi_i
+//
+// compute Bernstein mass-lumped recovery:
+//
+//      cB_j = (int f * B_j) / (int B_j)
+//
+// then convert the Bernstein coefficients cB back to
+// the usual FreeFEM Lagrange P3 function uh.
+//
+// Requires:
+//   LagrangeDualToBezierDualP3
+//   BezierToLagrangeP3
+//   Wb
+// =======================================================
+
+macro BezierLumpedRecoverP3(rhsL, uh) {
+    real[int] bp3rhsB(nBezierDof);
+    real[int] bp3coefB(nBezierDof);
+
+    LagrangeDualToBezierDualP3(rhsL, bp3rhsB);
+
+    for (int i = 0; i < nBezierDof; ++i) {
+        if (Wb[i] > 1.0e-30) {
+            bp3coefB[i] = bp3rhsB[i] / Wb[i];
+        }
+        else {
+            cout << "[warn] Wb small in BezierLumpedRecoverP3, i = "
+                 << i << " Wb = " << Wb[i] << endl;
+            bp3coefB[i] = 0.0;
+        }
+    }
+
+    BezierToLagrangeP3(bp3coefB, uh, BezierDofKP3);
+} //
+
+macro RhoPhysicalMinMax(rho, rhoPhysMin, rhoPhysMax) {
+    rhoPhysMin =  1.0e100;
+    rhoPhysMax = -1.0e100;
+
+    int nSample = 10;
+
+    for (int k = 0; k < Th.nt; ++k) {
+        real x0 = Th[k][0].x;
+        real y0 = Th[k][0].y;
+        real x1 = Th[k][1].x;
+        real y1 = Th[k][1].y;
+        real x2 = Th[k][2].x;
+        real y2 = Th[k][2].y;
+
+        for (int i = 0; i <= nSample; ++i) {
+            for (int j = 0; j <= nSample - i; ++j) {
+                real lam1 = 1.0*i/nSample;
+                real lam2 = 1.0*j/nSample;
+                real lam0 = 1.0 - lam1 - lam2;
+
+                real xq = lam0*x0 + lam1*x1 + lam2*x2;
+                real yq = lam0*y0 + lam1*y1 + lam2*y2;
+
+                real val = rho(xq, yq);
+
+                rhoPhysMin = min(rhoPhysMin, val);
+                rhoPhysMax = max(rhoPhysMax, val);
+            }
+        }
+    }
+} //
+
+
+////

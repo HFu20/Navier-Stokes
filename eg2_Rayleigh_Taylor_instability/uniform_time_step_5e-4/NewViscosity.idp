@@ -1,0 +1,492 @@
+// NewViscosity.idp
+// 2024 JCP Residual-Based Viscosity
+
+// ===========================================
+// Helper Macro: ComputeNGlob
+// ===========================================
+macro ComputeNGlobHist(w, histInf, result) {
+    real wMax = w[].max;
+    real wMin = w[].min;
+    real wDiff = abs(wMax - wMin);
+    result = (wDiff^2) / (wDiff + 1.0e-10 * histInf + 1.0e-16);
+} // EOM
+
+
+macro AddP3BernsteinContribution(rhsB, massB, ratioq) {
+    rhsB[g300] += wPhys * ratioq * B300;
+    rhsB[g030] += wPhys * ratioq * B030;
+    rhsB[g003] += wPhys * ratioq * B003;
+
+    rhsB[g210] += wPhys * ratioq * B210;
+    rhsB[g120] += wPhys * ratioq * B120;
+
+    rhsB[g021] += wPhys * ratioq * B021;
+    rhsB[g012] += wPhys * ratioq * B012;
+
+    rhsB[g102] += wPhys * ratioq * B102;
+    rhsB[g201] += wPhys * ratioq * B201;
+
+    rhsB[g111] += wPhys * ratioq * B111;
+
+    massB[g300] += wPhys * B300;
+    massB[g030] += wPhys * B030;
+    massB[g003] += wPhys * B003;
+
+    massB[g210] += wPhys * B210;
+    massB[g120] += wPhys * B120;
+
+    massB[g021] += wPhys * B021;
+    massB[g012] += wPhys * B012;
+
+    massB[g102] += wPhys * B102;
+    massB[g201] += wPhys * B201;
+
+    massB[g111] += wPhys * B111;
+} // EOM
+
+// ===========================================
+// Main Macro: ComputeResidualViscosity
+// ===========================================
+macro ComputeResidualViscosity(Th, XVh, u, v, p, rho, Nu, f1, f2, uOld, vOld, rhoOld, uOld2, vOld2, rhoOld2, 
+         uOld3, vOld3, rhoOld3, dt, Cflat, Cmax,hIn,histInfRhoU, histInfRhoUU, histInfU, Kappa, AlphaFinal,
+        RatioRho,RatioMom, RatioDiv, AlphaRaw,k,rvOrder ) {
+     XVh h = hIn;
+    XVh uMag = sqrt(u^2 + v^2);
+    XVh Nuh = Nu;
+
+    XVh w1 = rho * uMag;
+    XVh w2 = rho * square(uMag);
+
+histInfRhoU  = max(histInfRhoU,  w1[].linfty);
+histInfRhoUU = max(histInfRhoUU, w2[].linfty);
+histInfU     = max(histInfU,     uMag[].linfty);
+
+
+
+    /* --- Step 4: Global Scaling --- */
+    real nGlobRhoVal, nGlobMomVal, nGlobDivVal;
+    ComputeNGlobHist(w1,   histInfRhoU,  nGlobRhoVal);
+ComputeNGlobHist(w2,   histInfRhoUU, nGlobMomVal);
+ComputeNGlobHist(uMag, histInfU,     nGlobDivVal);
+    /* --- Switch Mechanism --- */
+    real epsSwitch = 0.05;
+      /* --- Step 5 : Alpha Calculation --- */
+/* --- RatioRho: P2 nodal patch-averaged normalized residual --- */
+/* --- RatioRho: positive Bernstein quadrature recovery --- */
+/*
+   Compute RatioRho by positive quadrature averaging in Bernstein basis.
+
+   This replaces both:
+     1. BezierLumpedRecoverP2(ratioRhoNum, RatioRho);
+     2. nodal patch average at only 6 P2 nodes.
+
+   Main idea:
+     ratio is evaluated at interior quadrature points,
+     then averaged to P2 Bernstein control coefficients
+     using nonnegative Bernstein basis functions.
+*/
+
+/* --- Step 5: Bernstein positive quadrature recovery for RatioRho, RatioMom and RatioDiv --- */
+/*
+   We compute all three normalized residual indicators by the same strategy:
+
+       Ratio = Bernstein-positive weighted average of pointwise residual ratios.
+
+   This avoids:
+     1. taking derivatives directly on inter-element boundaries;
+     2. using Lagrange weak recovery, which may create negative values or overshoots;
+     3. treating RatioRho, RatioMom and RatioDiv inconsistently.
+*/
+
+
+int nBezierDofP3 = XVh.ndof;
+
+int[int] BezierDofKP3(10*Th.nt);
+BuildBezierDofKP3(Th, XVh, BezierDofKP3);
+
+
+
+/* New: direct Galerkin RHS for alpha smoothing:
+   rhsActProj[i] = int actq * phi_i dx.
+*/
+real[int] rhsActProj(nBezierDofP3);
+
+rhsActProj = 0.0;
+
+
+real epsRatio = 1.0e-14;
+real epsSwitchNode = 0.05;
+
+/* Project forcing terms into XVh for point evaluation. */
+XVh F1h = f1;
+XVh F2h = f2;
+
+/* 12-point quadrature rule on the reference triangle.
+   The weights below sum to 1. The physical weight is areaK*wq.
+*/
+for (int kEl = 0; kEl < Th.nt; ++kEl) {
+
+    real x0 = Th[kEl][0].x;
+    real y0 = Th[kEl][0].y;
+    real x1 = Th[kEl][1].x;
+    real y1 = Th[kEl][1].y;
+    real x2 = Th[kEl][2].x;
+    real y2 = Th[kEl][2].y;
+
+    real areaEL = abs((x1-x0)*(y2-y0) - (x2-x0)*(y1-y0)) / 2.0;
+
+    for (int iq = 0; iq < 12; ++iq) {
+
+        real l0, l1, l2, wq;
+
+        if (iq == 0) {
+        l0 = 0.249286745170910; l1 = 0.249286745170910; l2 = 0.501426509658179;
+        wq = 0.116786275726379;
+    }
+    if (iq == 1) {
+        l0 = 0.249286745170910; l1 = 0.501426509658179; l2 = 0.249286745170910;
+        wq = 0.116786275726379;
+    }
+    if (iq == 2) {
+        l0 = 0.501426509658179; l1 = 0.249286745170910; l2 = 0.249286745170910;
+        wq = 0.116786275726379;
+    }
+
+    if (iq == 3) {
+        l0 = 0.063089014491502; l1 = 0.063089014491502; l2 = 0.873821971016996;
+        wq = 0.050844906370207;
+    }
+    if (iq == 4) {
+        l0 = 0.063089014491502; l1 = 0.873821971016996; l2 = 0.063089014491502;
+        wq = 0.050844906370207;
+    }
+    if (iq == 5) {
+        l0 = 0.873821971016996; l1 = 0.063089014491502; l2 = 0.063089014491502;
+        wq = 0.050844906370207;
+    }
+
+    if (iq == 6) {
+        l0 = 0.310352451033785; l1 = 0.636502499121399; l2 = 0.053145049844816;
+        wq = 0.082851075618374;
+    }
+
+    if (iq == 7) {
+        l0 = 0.310352451033785; l1 = 0.053145049844816; l2 = 0.636502499121399;
+        wq = 0.082851075618374;
+    }
+    if (iq == 8) {
+        l0 = 0.636502499121399; l1 = 0.310352451033785; l2 = 0.053145049844816;
+        wq = 0.082851075618374;
+    }
+    if (iq == 9) {
+        l0 = 0.636502499121399; l1 = 0.053145049844816; l2 = 0.310352451033785;
+        wq = 0.082851075618374;
+    }
+    if (iq == 10) {
+        l0 = 0.053145049844816; l1 = 0.310352451033785; l2 = 0.636502499121399;
+        wq = 0.082851075618374;
+    }
+    if (iq == 11) {
+        l0 = 0.053145049844816; l1 = 0.636502499121399; l2 = 0.310352451033785;
+        wq = 0.082851075618374;
+    }
+
+        real xq = l0*x0 + l1*x1 + l2*x2;
+        real yq = l0*y0 + l1*y1 + l2*y2;
+
+        /* ---------- Point values ---------- */
+        real rhoq = rho(xq,yq);
+        real uq   = u(xq,yq);
+        real vq   = v(xq,yq);
+
+        /* Viscosity value and derivatives at the quadrature point */
+        real Nuq  = Nuh(xq,yq);
+        real Nuxq = dx(Nuh)(xq,yq);
+        real Nuyq = dy(Nuh)(xq,yq);
+
+        real rhox = dx(rho)(xq,yq);
+        real rhoy = dy(rho)(xq,yq);
+
+        real ux = dx(u)(xq,yq);
+        real uy = dy(u)(xq,yq);
+        real vx = dx(v)(xq,yq);
+        real vy = dy(v)(xq,yq);
+
+        real divq = ux + vy;
+        real uMagq = sqrt(uq*uq + vq*vq);
+
+        real hq = h(xq,yq);
+
+        /* ---------- Time derivatives ---------- */
+       real dtRhoq  = 0.0;
+real dtRhoUq = 0.0;
+real dtRhoVq = 0.0;
+
+if (rvOrder == 1) {
+    dtRhoq =
+        ( rhoq
+        - rhoOld(xq,yq) ) / dt;
+
+    dtRhoUq =
+        ( rhoq*uq
+        - rhoOld(xq,yq)*uOld(xq,yq) ) / dt;
+
+    dtRhoVq =
+        ( rhoq*vq
+        - rhoOld(xq,yq)*vOld(xq,yq) ) / dt;
+}
+
+
+if (rvOrder == 2) {
+    dtRhoq =
+        ( 1.5*rhoq
+        - 2.0*rhoOld(xq,yq)
+        + 0.5*rhoOld2(xq,yq) ) / dt;
+
+    dtRhoUq =
+        ( 1.5*rhoq*uq
+        - 2.0*rhoOld(xq,yq)*uOld(xq,yq)
+        + 0.5*rhoOld2(xq,yq)*uOld2(xq,yq) ) / dt;
+
+    dtRhoVq =
+        ( 1.5*rhoq*vq
+        - 2.0*rhoOld(xq,yq)*vOld(xq,yq)
+        + 0.5*rhoOld2(xq,yq)*vOld2(xq,yq) ) / dt;
+}
+
+
+if (rvOrder == 3) {
+    dtRhoq =
+        ( 11.0*rhoq
+        - 18.0*rhoOld(xq,yq)
+        +  9.0*rhoOld2(xq,yq)
+        -  2.0*rhoOld3(xq,yq) ) / (6.0*dt);
+
+    dtRhoUq =
+        ( 11.0*rhoq*uq
+        - 18.0*rhoOld(xq,yq)*uOld(xq,yq)
+        +  9.0*rhoOld2(xq,yq)*uOld2(xq,yq)
+        -  2.0*rhoOld3(xq,yq)*uOld3(xq,yq) ) / (6.0*dt);
+
+    dtRhoVq =
+        ( 11.0*rhoq*vq
+        - 18.0*rhoOld(xq,yq)*vOld(xq,yq)
+        +  9.0*rhoOld2(xq,yq)*vOld2(xq,yq)
+        -  2.0*rhoOld3(xq,yq)*vOld3(xq,yq) ) / (6.0*dt);
+}
+        /* =========================================================
+           1. Density normalized residual ratio
+           ========================================================= */
+        real Rrhoq =
+            abs(dtRhoq + uq*rhox + vq*rhoy);
+
+        real gradRhoq = sqrt(rhox*rhox + rhoy*rhoy);
+
+        real nLocRhoq =
+              abs(dtRhoq)
+            + uMagq * gradRhoq
+            + 1.0e-10;
+
+        real nRhoFinalq =
+    (hq * gradRhoq > Cflat)
+    ? nLocRhoq
+    : max(nGlobRhoVal/hq, nLocRhoq);
+
+        real ratioRhoq = Rrhoq / (nRhoFinalq + epsRatio);
+       
+        /* =========================================================
+           2. Momentum normalized residual ratio
+           ========================================================= */
+
+        /* If Nu is variable, these two terms are necessary.
+           If Nu is constant, dx(Nu)=dy(Nu)=0 automatically.
+        */
+
+        real uxx = dxx(u)(xq,yq);
+        real uyy = dyy(u)(xq,yq);
+        real uxy = dxy(u)(xq,yq);
+
+        real vxx = dxx(v)(xq,yq);
+        real vyy = dyy(v)(xq,yq);
+        real vxy = dxy(v)(xq,yq);
+
+        real px = dx(p)(xq,yq);
+        real py = dy(p)(xq,yq);
+
+        real f1q = F1h(xq,yq);
+        real f2q = F2h(xq,yq);
+
+       /* Viscous operator:
+   div(2 Nu D(u)) with variable Nu.
+
+   Component x:
+       d_x(2 Nu u_x) + d_y(Nu (u_y + v_x))
+
+   Component y:
+       d_x(Nu (v_x + u_y)) + d_y(2 Nu v_y)
+*/
+real viscX =
+      2.0*Nuxq*ux
+    + 2.0*Nuq*uxx
+    + Nuyq*(uy + vx)
+    + Nuq*(uyy + vxy);
+
+real viscY =
+      Nuxq*(vx + uy)
+    + Nuq*(vxx + uxy)
+    + 2.0*Nuyq*vy
+    + 2.0*Nuq*vyy;
+
+        real convRhoUq =
+      uq*(rhox*uq + rhoq*ux)
+    + vq*(rhoy*uq + rhoq*uy);
+
+      real convRhoVq =
+      uq*(rhox*vq + rhoq*vx)
+    + vq*(rhoy*vq + rhoq*vy);
+    
+
+        real RmomX =
+              dtRhoUq
+            + convRhoUq
+            - viscX
+            + px - f1q;
+
+        real RmomY =
+              dtRhoVq
+            + convRhoVq
+            - viscY
+            + py - f2q;
+
+        real Rmomq = sqrt(RmomX*RmomX + RmomY*RmomY);
+
+        real gradUq = sqrt(ux*ux + uy*uy + vx*vx + vy*vy);
+
+real gradRhoUq =
+            sqrt(
+                square(uq*rhox + rhoq*ux)
+              + square(uq*rhoy + rhoq*uy)
+              + square(vq*rhox + rhoq*vx)
+              + square(vq*rhoy + rhoq*vy)
+            );
+
+        real nLocMomq =
+              sqrt(sqr(dtRhoUq) + sqr(dtRhoVq))
+    + uMagq * gradRhoUq
+    + sqrt(sqr(viscX) + sqr(viscY))
+    + sqrt(sqr(px) + sqr(py))
+    + sqrt(sqr(f1q) + sqr(f2q))
+            + 1.0e-10;
+
+        
+
+        real nMomFinalq =
+    (hq * gradRhoUq > Cflat)
+    ? nLocMomq
+    : max(nGlobMomVal/hq, nLocMomq);
+
+
+        real ratioMomq = Rmomq / (nMomFinalq + epsRatio);
+
+        /* =========================================================
+           3. Divergence normalized residual ratio
+           ========================================================= */
+        real nLocDivq = gradUq + 1.0e-10;
+
+        real nDivFinalq =
+    (hq * gradUq > Cflat)
+    ? nLocDivq
+    : max(nGlobDivVal/hq, nLocDivq);
+
+        real ratioDivq = abs(divq) / (nDivFinalq + epsRatio);
+
+ratioRhoq = min(1.0, max(0.0, ratioRhoq));
+ratioMomq = min(1.0, max(0.0, ratioMomq));
+ratioDivq = min(1.0, max(0.0, ratioDivq));
+
+real rawq = max(ratioRhoq, ratioMomq);
+rawq = max(rawq, ratioDivq);
+rawq = min(1.0, max(0.0, rawq));
+
+real actq = 0.61 * (rawq^1.23);
+
+real wPhys = areaEL * wq;
+
+/* ---------- P3 Lagrange basis values at quadrature point ---------- */
+/* Vertex nodes */
+real L300 = 0.5*l0*(3.0*l0 - 1.0)*(3.0*l0 - 2.0);
+real L030 = 0.5*l1*(3.0*l1 - 1.0)*(3.0*l1 - 2.0);
+real L003 = 0.5*l2*(3.0*l2 - 1.0)*(3.0*l2 - 2.0);
+
+/* Edge nodes on edge 0-1 */
+real L210 = 4.5*l0*l1*(3.0*l0 - 1.0);
+real L120 = 4.5*l0*l1*(3.0*l1 - 1.0);
+
+/* Edge nodes on edge 1-2 */
+real L021 = 4.5*l1*l2*(3.0*l1 - 1.0);
+real L012 = 4.5*l1*l2*(3.0*l2 - 1.0);
+
+/* Edge nodes on edge 0-2 */
+real L102 = 4.5*l0*l2*(3.0*l2 - 1.0);
+real L201 = 4.5*l0*l2*(3.0*l0 - 1.0);
+
+/* Interior node */
+real L111 = 27.0*l0*l1*l2;
+
+int g300 = BezierDofKP3[10*kEl + 0];
+int g030 = BezierDofKP3[10*kEl + 1];
+int g003 = BezierDofKP3[10*kEl + 2];
+
+int g210 = BezierDofKP3[10*kEl + 3];
+int g120 = BezierDofKP3[10*kEl + 4];
+
+int g021 = BezierDofKP3[10*kEl + 5];
+int g012 = BezierDofKP3[10*kEl + 6];
+
+int g102 = BezierDofKP3[10*kEl + 7];
+int g201 = BezierDofKP3[10*kEl + 8];
+
+int g111 = BezierDofKP3[10*kEl + 9];
+
+/* ---------- Direct RHS assembly for alpha smoothing ----------
+   rhsActProj[i] += int_K actq * phi_i dx
+   Here actq is a quadrature-point value, not a Bezier coefficient.
+*/
+rhsActProj[g300] += wPhys * actq * L300;
+rhsActProj[g030] += wPhys * actq * L030;
+rhsActProj[g003] += wPhys * actq * L003;
+
+rhsActProj[g210] += wPhys * actq * L210;
+rhsActProj[g120] += wPhys * actq * L120;
+
+rhsActProj[g021] += wPhys * actq * L021;
+rhsActProj[g012] += wPhys * actq * L012;
+
+rhsActProj[g102] += wPhys * actq * L102;
+rhsActProj[g201] += wPhys * actq * L201;
+
+rhsActProj[g111] += wPhys * actq * L111;
+   
+    }
+}
+
+/*---------------------------------------------------------
+ Compute rStar = approximate 98% quantile of AlphaRaw
+ by a histogram on [0,1].
+ ---------------------------------------------------------*/
+
+
+     XVh AlphaSmooth, wTest;
+
+
+/* Direct RHS:
+   rhsActProj[i] = int 15*Rmax^2 * phi_i dx
+*/
+AlphaSmooth[] = Aalpha^-1 * rhsActProj;
+
+
+    AlphaFinal = min(1.0, abs(AlphaSmooth));
+    /* --- Step 6: Final Viscosity --- */
+    Kappa = AlphaFinal * h * Cmax * uMag;
+
+} // EOM
